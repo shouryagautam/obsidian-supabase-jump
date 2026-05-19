@@ -1,41 +1,31 @@
 import { Notice, TFile, Vault, Platform } from "obsidian";
 import { SupabaseClient } from "@supabase/supabase-js";
-import { isBinary, isExcluded, isPlatformExcluded, isSystemFile } from "./settings";
+import { isBinary, isExcluded, isPlatformExcluded, isSystemFile, SupaBaseJumpSettings } from "./settings";
 import { parseFrontmatter } from "./frontmatter";
-import { SyncStatus } from "./supabase";
+import { ProjectClientPool, ProjectStatusState, isJwtExpired, isRlsError } from "./project-client-pool";
+import { superviseChannel, SupervisedChannel } from "./realtime-supervisor";
+import { shardFor, enabledOrdered } from "./routing";
+import { logger } from "./logger";
 
 const STORAGE_BUCKET = "vault-attachments";
 const DB_TABLE = "vault_files";
 const DEBOUNCE_MS = 1000;
 const PULL_IGNORE_TTL = 1500;
 const CONFIG_WATCH_MS = 5000;
-const REALTIME_RECONNECT_MS = 5000;
+
+export type SyncStatus = ProjectStatusState;
 
 function stripNullBytes(s: string): string {
-	// Postgres text type rejects null bytes; strip them rather than crash.
-	// Using split/join avoids the no-control-regex lint rule.
 	return s.includes("\0") ? s.split("\0").join("") : s;
 }
 
-function toStoragePath(
-	userId: string,
-	vaultId: string,
-	filePath: string,
-): string {
+function toStoragePath(userId: string, vaultId: string, filePath: string): string {
 	const bytes = new TextEncoder().encode(filePath);
 	let binary = "";
 	for (const byte of bytes) binary += String.fromCharCode(byte);
-	const b64url = btoa(binary)
-		.replace(/\+/g, "-")
-		.replace(/\//g, "_")
-		.replace(/=/g, "");
-
+	const b64url = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
 	const dotIdx = filePath.lastIndexOf(".");
-	const ext =
-		dotIdx >= 0
-			? filePath.slice(dotIdx).replace(/[^a-zA-Z0-9.]/g, "_")
-			: "";
-
+	const ext = dotIdx >= 0 ? filePath.slice(dotIdx).replace(/[^a-zA-Z0-9.]/g, "_") : "";
 	return `${userId}/${vaultId}/${b64url}${ext}`;
 }
 
@@ -59,22 +49,19 @@ export interface VaultFileRow {
 
 export interface SyncHost {
 	readonly vault: Vault;
-	readonly settings: {
-		vaultId: string;
-		syncOnStartup: boolean;
-		syncConfigFolder: boolean;
-		syncIntervalMinutes: number;
-		excludedFolders: string[];
-		platformExcludedPaths: string[];
-		lastSyncTime: number;
-	};
-	readonly supabase: SupabaseClient | null;
+	readonly settings: SupaBaseJumpSettings;
+	readonly pool: ProjectClientPool;
 	saveSettings(): Promise<void>;
 	setStatus(status: SyncStatus): void;
 }
 
 function toRowId(vaultId: string, filePath: string): string {
 	return `${vaultId}::${filePath.replace(/\//g, "__SLASH__")}`;
+}
+
+interface RemoteLocation {
+	projectId: string;
+	row: VaultFileRow;
 }
 
 export class SyncEngine {
@@ -85,27 +72,28 @@ export class SyncEngine {
 	private configWatcherId: number | null = null;
 	private configFileCache = new Map<string, number>();
 	private ignorePaths = new Set<string>();
-	private realtimeReconnectTimer: number | null = null;
+	private realtimeChannels = new Map<string, SupervisedChannel>();
 
-	// Injected by main.ts after both managers are created.
-	// Returns true while the CRDT broadcast channel owns that file's editing session.
 	crdtIsActive: ((path: string) => boolean) | null = null;
 
 	constructor(host: SyncHost) {
 		this.host = host;
 	}
 
-	private get client(): SupabaseClient {
-		const { supabase } = this.host;
-		if (!supabase) throw new Error("Supabase jump: not connected.");
-		return supabase;
+	private clientFor(path: string): { client: SupabaseClient; projectId: string } {
+		const rt = this.host.pool.forFile(path);
+		if (!rt) throw new Error("Supabase jump: no enabled project for this file.");
+		return { client: rt.client, projectId: rt.id };
 	}
 
-	private async getUserId(): Promise<string> {
-		const { data, error } = await this.client.auth.getUser();
-		if (error || !data.user)
-			throw new Error("Supabase jump: not authenticated.");
-		return data.user.id;
+	private clientForProject(projectId: string): SupabaseClient {
+		const rt = this.host.pool.getRuntime(projectId);
+		if (!rt) throw new Error("Supabase jump: project not connected.");
+		return rt.client;
+	}
+
+	private async userIdFor(projectId: string): Promise<string> {
+		return await this.host.pool.getUserId(projectId);
 	}
 
 	private shouldSkip(filePath: string): boolean {
@@ -135,7 +123,7 @@ export class SyncEngine {
 				result.push(...(await this.listAdapterFiles(sub)));
 			}
 		} catch {
-			// Folder may already exist
+			// Folder may not exist
 		}
 		return result;
 	}
@@ -148,74 +136,6 @@ export class SyncEngine {
 			return stat?.mtime ?? 0;
 		} catch {
 			return 0;
-		}
-	}
-
-	private async pushAdapterFile(
-		filePath: string,
-		userId: string,
-		vaultId: string,
-	): Promise<void> {
-		const stat = await this.host.vault.adapter.stat(filePath);
-		if (!stat || stat.type !== "file") return;
-
-		const rowId = toRowId(vaultId, filePath);
-
-		if (isBinary(filePath)) {
-			const data = await this.host.vault.adapter.readBinary(filePath);
-			const storagePath = toStoragePath(userId, vaultId, filePath);
-
-			const { error: uploadErr } = await this.client.storage
-				.from(STORAGE_BUCKET)
-				.upload(storagePath, data, { upsert: true });
-			if (uploadErr)
-				throw new Error(`Storage upload failed - ${uploadErr.message}`);
-
-			const { error: dbErr } = await this.client.from(DB_TABLE).upsert({
-				id: rowId,
-				user_id: userId,
-				vault_id: vaultId,
-				path: filePath,
-				is_binary: true,
-				storage_path: storagePath,
-				content: null,
-				platform: this.getPlatformForPath(filePath),
-				mtime: stat.mtime,
-				ctime: stat.ctime ?? stat.mtime,
-				size: stat.size ?? 0,
-				deleted: false,
-				updated_at: new Date().toISOString(),
-			});
-			if (dbErr)
-				throw new Error(`Metadata upsert failed - ${dbErr.message}`);
-		} else {
-			const raw = await this.host.vault.adapter.read(filePath);
-			const content = stripNullBytes(raw);
-
-			const isMarkdown = filePath.endsWith(".md");
-			const { properties, tags } = isMarkdown
-				? parseFrontmatter(content)
-				: { properties: {}, tags: [] };
-
-			const { error } = await this.client.from(DB_TABLE).upsert({
-				id: rowId,
-				user_id: userId,
-				vault_id: vaultId,
-				path: filePath,
-				is_binary: false,
-				storage_path: null,
-				content,
-				frontmatter:
-					Object.keys(properties).length > 0 ? properties : null,
-				tags: tags.length > 0 ? tags : null,
-				platform: this.getPlatformForPath(filePath),
-				mtime: stat.mtime,
-				ctime: stat.ctime ?? stat.mtime,
-				size: stat.size ?? 0,
-				deleted: false,
-				updated_at: new Date().toISOString(),
-			});
-			if (error) throw new Error(`Upsert failed - ${error.message}`);
 		}
 	}
 
@@ -248,53 +168,41 @@ export class SyncEngine {
 
 	async pushFile(file: TFile): Promise<void> {
 		const { vaultId } = this.host.settings;
-		const userId = await this.getUserId();
+		const { client, projectId } = this.clientFor(file.path);
+		const userId = await this.userIdFor(projectId);
 		const rowId = toRowId(vaultId, file.path);
 
 		try {
 			if (isBinary(file.path)) {
-				await this.pushBinaryFile(file, userId, vaultId, rowId);
+				await this.pushBinaryFile(client, file, userId, vaultId, rowId);
 			} else {
-				await this.pushTextFile(file, userId, vaultId, rowId);
+				await this.pushTextFile(client, file, userId, vaultId, rowId);
 			}
+			logger.debug("sync", `pushed ${file.path}`, { projectId });
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
-			console.error(
-				`Supabase jump: pushFile failed for "${file.path}"`,
-				err,
-			);
-			new Notice(
-				`Supabase jump: Push failed for "${file.path}" - ${msg}`,
-			);
+			logger.error("sync", `pushFile failed for "${file.path}"`, { error: msg, projectId });
+			new Notice(`Supabase jump: push failed for "${file.path}" — ${msg}`);
 			throw err;
 		}
 	}
 
 	private async pushBinaryFile(
+		client: SupabaseClient,
 		file: TFile,
 		userId: string,
 		vaultId: string,
 		rowId: string,
 	): Promise<void> {
-		let data: ArrayBuffer;
-		try {
-			data = await this.host.vault.readBinary(file);
-		} catch (err) {
-			throw new Error(
-				`Could not read "${file.path}" - ${err instanceof Error ? err.message : String(err)}`,
-			);
-		}
-
+		const data = await this.host.vault.readBinary(file);
 		const storagePath = toStoragePath(userId, vaultId, file.path);
 
-		const { error: uploadErr } = await this.client.storage
+		const { error: uploadErr } = await client.storage
 			.from(STORAGE_BUCKET)
 			.upload(storagePath, data, { upsert: true });
+		if (uploadErr) throw new Error(`Storage upload failed — ${uploadErr.message}`);
 
-		if (uploadErr)
-			throw new Error(`Storage upload failed - ${uploadErr.message}`);
-
-		const { error: dbErr } = await this.client.from(DB_TABLE).upsert({
+		const { error: dbErr } = await client.from(DB_TABLE).upsert({
 			id: rowId,
 			user_id: userId,
 			vault_id: vaultId,
@@ -309,39 +217,32 @@ export class SyncEngine {
 			deleted: false,
 			updated_at: new Date().toISOString(),
 		});
-
-		if (dbErr) throw new Error(`Metadata upsert failed - ${dbErr.message}`);
+		if (dbErr) throw new Error(`Metadata upsert failed — ${dbErr.message}`);
 	}
 
 	private async pushTextFile(
+		client: SupabaseClient,
 		file: TFile,
 		userId: string,
 		vaultId: string,
 		rowId: string,
 	): Promise<void> {
-		let content: string;
-		try {
-			content = await this.host.vault.read(file);
-		} catch (err) {
-			throw new Error(
-				`Could not read "${file.path}" - ${err instanceof Error ? err.message : String(err)}`,
-			);
-		}
+		let raw = await this.host.vault.read(file);
+		raw = stripNullBytes(raw);
 
-		content = stripNullBytes(content);
 		const isMarkdown = file.path.endsWith(".md");
 		const { properties, tags } = isMarkdown
-			? parseFrontmatter(content)
+			? parseFrontmatter(raw)
 			: { properties: {}, tags: [] };
 
-		const { error } = await this.client.from(DB_TABLE).upsert({
+		const { error } = await client.from(DB_TABLE).upsert({
 			id: rowId,
 			user_id: userId,
 			vault_id: vaultId,
 			path: file.path,
 			is_binary: false,
 			storage_path: null,
-			content,
+			content: raw,
 			frontmatter: Object.keys(properties).length > 0 ? properties : null,
 			tags: tags.length > 0 ? tags : null,
 			platform: this.getPlatformForPath(file.path),
@@ -351,43 +252,97 @@ export class SyncEngine {
 			deleted: false,
 			updated_at: new Date().toISOString(),
 		});
-
-		if (error) throw new Error(`Upsert failed - ${error.message}`);
+		if (error) throw new Error(`Upsert failed — ${error.message}`);
 	}
 
-	async pullFile(row: VaultFileRow): Promise<void> {
+	private async pushAdapterFile(
+		filePath: string,
+		userId: string,
+		vaultId: string,
+		client: SupabaseClient,
+	): Promise<void> {
+		const stat = await this.host.vault.adapter.stat(filePath);
+		if (!stat || stat.type !== "file") return;
+
+		const rowId = toRowId(vaultId, filePath);
+
+		if (isBinary(filePath)) {
+			const data = await this.host.vault.adapter.readBinary(filePath);
+			const storagePath = toStoragePath(userId, vaultId, filePath);
+
+			const { error: uploadErr } = await client.storage
+				.from(STORAGE_BUCKET)
+				.upload(storagePath, data, { upsert: true });
+			if (uploadErr) throw new Error(`Storage upload failed — ${uploadErr.message}`);
+
+			const { error: dbErr } = await client.from(DB_TABLE).upsert({
+				id: rowId,
+				user_id: userId,
+				vault_id: vaultId,
+				path: filePath,
+				is_binary: true,
+				storage_path: storagePath,
+				content: null,
+				platform: this.getPlatformForPath(filePath),
+				mtime: stat.mtime,
+				ctime: stat.ctime ?? stat.mtime,
+				size: stat.size ?? 0,
+				deleted: false,
+				updated_at: new Date().toISOString(),
+			});
+			if (dbErr) throw new Error(`Metadata upsert failed — ${dbErr.message}`);
+		} else {
+			const raw = await this.host.vault.adapter.read(filePath);
+			const content = stripNullBytes(raw);
+			const isMarkdown = filePath.endsWith(".md");
+			const { properties, tags } = isMarkdown
+				? parseFrontmatter(content)
+				: { properties: {}, tags: [] };
+
+			const { error } = await client.from(DB_TABLE).upsert({
+				id: rowId,
+				user_id: userId,
+				vault_id: vaultId,
+				path: filePath,
+				is_binary: false,
+				storage_path: null,
+				content,
+				frontmatter: Object.keys(properties).length > 0 ? properties : null,
+				tags: tags.length > 0 ? tags : null,
+				platform: this.getPlatformForPath(filePath),
+				mtime: stat.mtime,
+				ctime: stat.ctime ?? stat.mtime,
+				size: stat.size ?? 0,
+				deleted: false,
+				updated_at: new Date().toISOString(),
+			});
+			if (error) throw new Error(`Upsert failed — ${error.message}`);
+		}
+	}
+
+	async pullFile(row: VaultFileRow, projectId: string): Promise<void> {
 		try {
 			await this.ensureFolder(row.path);
-
 			if (row.is_binary) {
-				await this.pullBinaryFile(row);
+				await this.pullBinaryFile(row, projectId);
 			} else {
 				await this.pullTextFile(row);
 			}
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
-			console.error(
-				`Supabase jump: pullFile failed for "${row.path}"`,
-				err,
-			);
-			new Notice(`Supabase jump: Pull failed for "${row.path}" - ${msg}`);
+			logger.error("sync", `pullFile failed for "${row.path}"`, { error: msg, projectId });
+			new Notice(`Supabase jump: pull failed for "${row.path}" — ${msg}`);
 			throw err;
 		}
 	}
 
-	private async pullBinaryFile(row: VaultFileRow): Promise<void> {
-		if (!row.storage_path) {
-			throw new Error(`missing storage_path for "${row.path}"`);
-		}
+	private async pullBinaryFile(row: VaultFileRow, projectId: string): Promise<void> {
+		if (!row.storage_path) throw new Error(`missing storage_path for "${row.path}"`);
 
-		const { data, error } = await this.client.storage
-			.from(STORAGE_BUCKET)
-			.download(row.storage_path);
-
+		const client = this.clientForProject(projectId);
+		const { data, error } = await client.storage.from(STORAGE_BUCKET).download(row.storage_path);
 		if (error || !data) {
-			throw new Error(
-				`storage download failed - ${error?.message ?? "no data returned"}`,
-			);
+			throw new Error(`storage download failed — ${error?.message ?? "no data returned"}`);
 		}
 
 		const buffer = await data.arrayBuffer();
@@ -404,7 +359,6 @@ export class SyncEngine {
 			try {
 				await this.host.vault.createBinary(row.path, buffer);
 			} catch {
-				// Fallback for paths outside vault index
 				await this.host.vault.adapter.writeBinary(row.path, buffer);
 			}
 		}
@@ -425,63 +379,137 @@ export class SyncEngine {
 			try {
 				await this.host.vault.create(row.path, content);
 			} catch {
-				// Fallback for paths outside vault index
 				await this.host.vault.adapter.write(row.path, content);
 			}
 		}
 	}
 
 	async deleteRemoteFile(path: string): Promise<void> {
-		try {
-			const { vaultId } = this.host.settings;
-			const rowId = toRowId(vaultId, path);
+		// During rebalance the file might live on a different shard than its
+		// current routing target. Delete from every enabled project that has the row.
+		const { vaultId } = this.host.settings;
+		const rowId = toRowId(vaultId, path);
+		const errors: string[] = [];
 
-			const { data, error: fetchErr } = await this.client
-				.from(DB_TABLE)
-				.select("is_binary, storage_path")
-				.eq("id", rowId)
-				.single<Pick<VaultFileRow, "is_binary" | "storage_path">>();
-
-			if (fetchErr)
-				throw new Error(
-					`could not fetch row for "${path}" - ${fetchErr.message}`,
-				);
-
-			const { error: updateErr } = await this.client
-				.from(DB_TABLE)
-				.update({ deleted: true, updated_at: new Date().toISOString() })
-				.eq("id", rowId);
-
-			if (updateErr)
-				throw new Error(`soft delete failed - ${updateErr.message}`);
-
-			if (data?.is_binary && data.storage_path) {
-				const { error: storageErr } = await this.client.storage
-					.from(STORAGE_BUCKET)
-					.remove([data.storage_path]);
-
-				if (storageErr) {
-					console.warn(
-						`Supabase jump: Storage removal failed - ${storageErr.message}`,
-					);
+		for (const rt of this.host.pool.forAllEnabled()) {
+			try {
+				const { data, error: fetchErr } = await rt.client
+					.from(DB_TABLE)
+					.select("is_binary, storage_path")
+					.eq("id", rowId)
+					.maybeSingle<Pick<VaultFileRow, "is_binary" | "storage_path">>();
+				if (fetchErr) {
+					errors.push(`${rt.id}: ${fetchErr.message}`);
+					continue;
 				}
+				if (!data) continue;
+
+				const { error: updateErr } = await rt.client
+					.from(DB_TABLE)
+					.update({ deleted: true, updated_at: new Date().toISOString() })
+					.eq("id", rowId);
+				if (updateErr) {
+					errors.push(`${rt.id}: ${updateErr.message}`);
+					continue;
+				}
+
+				if (data.is_binary && data.storage_path) {
+					const { error: storageErr } = await rt.client.storage
+						.from(STORAGE_BUCKET)
+						.remove([data.storage_path]);
+					if (storageErr) {
+						logger.warn("sync", `storage removal failed`, { projectId: rt.id, error: storageErr.message });
+					}
+				}
+			} catch (err) {
+				errors.push(`${rt.id}: ${err instanceof Error ? err.message : String(err)}`);
 			}
-		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			console.error(
-				`Supabase jump: deleteRemoteFile failed for "${path}"`,
-				err,
-			);
-			new Notice(`Supabase jump: Delete failed for "${path}" - ${msg}`);
-			throw err;
+		}
+
+		if (errors.length > 0) {
+			const msg = errors.join("; ");
+			logger.error("sync", `deleteRemoteFile partial failure for "${path}"`, { errors });
+			new Notice(`Supabase jump: delete partially failed for "${path}" — ${msg}`);
+			throw new Error(msg);
+		}
+	}
+
+	private async collectRemoteRows(): Promise<Map<string, RemoteLocation>> {
+		const { vaultId } = this.host.settings;
+		const remoteMap = new Map<string, RemoteLocation>();
+
+		for (const rt of this.host.pool.forAllEnabled()) {
+			try {
+				const { data, error } = await rt.client
+					.from(DB_TABLE)
+					.select("*")
+					.eq("vault_id", vaultId)
+					.eq("deleted", false);
+				if (error) {
+					if (isJwtExpired(error)) {
+						const ok = await this.host.pool.refreshSession(rt.id);
+						if (ok) {
+							const retry = await rt.client
+								.from(DB_TABLE)
+								.select("*")
+								.eq("vault_id", vaultId)
+								.eq("deleted", false);
+							if (!retry.error && retry.data) {
+								for (const row of retry.data as VaultFileRow[]) {
+									this.acceptRemoteRow(remoteMap, row, rt.id);
+								}
+								continue;
+							}
+						}
+					}
+					if (isRlsError(error)) {
+						logger.error("sync", `RLS rejected query`, { projectId: rt.id });
+						new Notice(`Supabase jump: project ${rt.id.slice(0, 6)}… rejected the query — check RLS policy.`);
+						continue;
+					}
+					logger.error("sync", `failed to fetch remote rows`, { projectId: rt.id, error: error.message });
+					continue;
+				}
+				for (const row of (data as VaultFileRow[]) ?? []) {
+					this.acceptRemoteRow(remoteMap, row, rt.id);
+				}
+			} catch (err) {
+				logger.error("sync", `remote query threw`, {
+					projectId: rt.id,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+		}
+
+		return remoteMap;
+	}
+
+	private acceptRemoteRow(
+		remoteMap: Map<string, RemoteLocation>,
+		row: VaultFileRow,
+		projectId: string,
+	): void {
+		const existing = remoteMap.get(row.path);
+		if (!existing) {
+			remoteMap.set(row.path, { projectId, row });
+			return;
+		}
+		// Two projects carry the same row (a rebalance is in progress or settings changed).
+		// Prefer the row from the shard that *should* own this path under the current routing.
+		const expected = shardFor(row.path, this.host.settings.projects, this.host.settings.routing.hashSalt);
+		if (expected?.id === projectId) {
+			remoteMap.set(row.path, { projectId, row });
 		}
 	}
 
 	async fetchOnly(): Promise<void> {
 		const { vaultId } = this.host.settings;
-
 		if (!vaultId) {
-			new Notice("Supabase jump: vault ID is not set - cannot fetch");
+			new Notice("Supabase jump: vault ID is not set — cannot fetch");
+			return;
+		}
+		if (this.host.pool.enabledProjectCount() === 0) {
+			new Notice("Supabase jump: no enabled projects — cannot fetch");
 			return;
 		}
 
@@ -489,29 +517,18 @@ export class SyncEngine {
 		const errors: string[] = [];
 
 		try {
-			const { data, error } = await this.client
-				.from(DB_TABLE)
-				.select("*")
-				.eq("vault_id", vaultId)
-				.eq("deleted", false);
+			const remoteMap = await this.collectRemoteRows();
 
-			if (error)
-				throw new Error(
-					`failed to fetch remote files - ${error.message}`,
-				);
-
-			const remoteRows = (data as VaultFileRow[]) ?? [];
-
-			for (const row of remoteRows) {
-				if (this.shouldSkip(row.path)) continue;
-				if (!this.shouldPull(row)) continue;
-				if (this.crdtIsActive?.(row.path)) continue;
-				const localMtime = await this.getLocalMtime(row.path);
-				if (row.mtime > localMtime) {
+			for (const [, loc] of remoteMap) {
+				if (this.shouldSkip(loc.row.path)) continue;
+				if (!this.shouldPull(loc.row)) continue;
+				if (this.crdtIsActive?.(loc.row.path)) continue;
+				const localMtime = await this.getLocalMtime(loc.row.path);
+				if (loc.row.mtime > localMtime) {
 					try {
-						await this.pullFile(row);
+						await this.pullFile(loc.row, loc.projectId);
 					} catch {
-						errors.push(row.path);
+						errors.push(loc.row.path);
 					}
 				}
 			}
@@ -521,23 +538,25 @@ export class SyncEngine {
 			this.host.setStatus("synced");
 
 			const s = errors.length;
-			const suffix =
-				s > 0 ? ` (${s} error${s > 1 ? "s" : ""} - see console)` : "";
-			new Notice(`Supabase jump: Fetch complete${suffix}`);
+			const suffix = s > 0 ? ` (${s} error${s > 1 ? "s" : ""} — open log panel)` : "";
+			new Notice(`Supabase jump: fetch complete${suffix}`);
 		} catch (err) {
-			console.error("Supabase jump: fetchOnly failed", err);
+			logger.error("sync", `fetchOnly failed`, { error: err instanceof Error ? err.message : String(err) });
 			this.host.setStatus("error");
 			new Notice(
-				`Supabase jump: Fetch failed - ${err instanceof Error ? err.message : String(err)}`,
+				`Supabase jump: fetch failed — ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}
 	}
 
 	async fullSync(): Promise<void> {
 		const { vaultId } = this.host.settings;
-
 		if (!vaultId) {
-			new Notice("Supabase jump: vault ID is not set - cannot sync");
+			new Notice("Supabase jump: vault ID is not set — cannot sync");
+			return;
+		}
+		if (this.host.pool.enabledProjectCount() === 0) {
+			new Notice("Supabase jump: no enabled projects — cannot sync");
 			return;
 		}
 
@@ -545,29 +564,12 @@ export class SyncEngine {
 		const errors: string[] = [];
 
 		try {
-			const { data, error } = await this.client
-				.from(DB_TABLE)
-				.select("*")
-				.eq("vault_id", vaultId)
-				.eq("deleted", false);
+			const remoteMap = await this.collectRemoteRows();
 
-			if (error)
-				throw new Error(
-					`failed to fetch remote files - ${error.message}`,
-				);
-
-			const remoteRows = (data as VaultFileRow[]) ?? [];
-			const remoteMap = new Map<string, VaultFileRow>(
-				remoteRows.map((r) => [r.path, r]),
-			);
-
-			const localFiles = this.host.vault
-				.getFiles()
-				.filter((f) => !this.shouldSkip(f.path));
-
+			const localFiles = this.host.vault.getFiles().filter((f) => !this.shouldSkip(f.path));
 			for (const file of localFiles) {
 				const remote = remoteMap.get(file.path);
-				if (!remote || file.stat.mtime > remote.mtime) {
+				if (!remote || file.stat.mtime > remote.row.mtime) {
 					try {
 						await this.pushFile(file);
 					} catch {
@@ -576,25 +578,22 @@ export class SyncEngine {
 				}
 			}
 
-			// Push config files not enumerated by vault.getFiles()
-			const configPaths = await this.listAdapterFiles(
-				this.host.vault.configDir,
-			);
+			const configPaths = await this.listAdapterFiles(this.host.vault.configDir);
 			if (configPaths.length > 0) {
-				const userId = await this.getUserId();
 				for (const configPath of configPaths) {
 					if (this.shouldSkip(configPath)) continue;
-					const stat =
-						await this.host.vault.adapter.stat(configPath);
+					const stat = await this.host.vault.adapter.stat(configPath);
 					if (!stat || stat.type !== "file") continue;
 					const remote = remoteMap.get(configPath);
-					if (!remote || stat.mtime > remote.mtime) {
+					if (!remote || stat.mtime > remote.row.mtime) {
 						try {
-							await this.pushAdapterFile(
-								configPath,
-								userId,
-								vaultId,
-							);
+							const rt = this.host.pool.forFile(configPath);
+							if (!rt) {
+								errors.push(configPath);
+								continue;
+							}
+							const userId = await this.userIdFor(rt.id);
+							await this.pushAdapterFile(configPath, userId, vaultId, rt.client);
 						} catch {
 							errors.push(configPath);
 						}
@@ -602,92 +601,89 @@ export class SyncEngine {
 				}
 			}
 
-			for (const row of remoteRows) {
-				if (this.shouldSkip(row.path)) continue;
-				if (!this.shouldPull(row)) continue;
-				if (this.crdtIsActive?.(row.path)) continue;
-				const localMtime = await this.getLocalMtime(row.path);
-				if (row.mtime > localMtime) {
+			for (const [, loc] of remoteMap) {
+				if (this.shouldSkip(loc.row.path)) continue;
+				if (!this.shouldPull(loc.row)) continue;
+				if (this.crdtIsActive?.(loc.row.path)) continue;
+				const localMtime = await this.getLocalMtime(loc.row.path);
+				if (loc.row.mtime > localMtime) {
 					try {
-						await this.pullFile(row);
+						await this.pullFile(loc.row, loc.projectId);
 					} catch {
-						errors.push(row.path);
+						errors.push(loc.row.path);
 					}
 				}
 			}
 
 			this.host.settings.lastSyncTime = Date.now();
 			await this.host.saveSettings();
-
 			this.host.setStatus("synced");
 
 			const s = errors.length;
-			const suffix =
-				s > 0 ? ` (${s} error${s > 1 ? "s" : ""} - see console)` : "";
-			new Notice(`Supabase jump: Sync complete${suffix}`);
+			const suffix = s > 0 ? ` (${s} error${s > 1 ? "s" : ""} — open log panel)` : "";
+			new Notice(`Supabase jump: sync complete${suffix}`);
 		} catch (err) {
-			console.error("Supabase jump: fullSync failed", err);
+			logger.error("sync", `fullSync failed`, { error: err instanceof Error ? err.message : String(err) });
 			this.host.setStatus("error");
 			new Notice(
-				`Supabase jump: Sync failed - ${err instanceof Error ? err.message : String(err)}`,
+				`Supabase jump: sync failed — ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}
 	}
 
-	startRealtimeListener(): void {
+	startRealtimeListeners(): void {
+		this.stopRealtimeListeners();
 		const { vaultId } = this.host.settings;
 		if (!vaultId) return;
 
-		this.client
-			.channel(`vault-${vaultId}`)
-			.on<VaultFileRow>(
-				"postgres_changes",
-				{
-					event: "*",
-					schema: "public",
-					table: DB_TABLE,
-					filter: `vault_id=eq.${vaultId}`,
+		for (const project of enabledOrdered(this.host.settings.projects)) {
+			const rt = this.host.pool.getRuntime(project.id);
+			if (!rt) continue;
+
+			const supervised = superviseChannel({
+				scope: `realtime:${project.id.slice(0, 6)}`,
+				label: project.label,
+				tuning: this.host.settings.realtime,
+				client: rt.client,
+				build: (client) =>
+					client.channel(`vault-${vaultId}-${project.id.slice(0, 8)}`).on<VaultFileRow>(
+						"postgres_changes",
+						{
+							event: "*",
+							schema: "public",
+							table: DB_TABLE,
+							filter: `vault_id=eq.${vaultId}`,
+						},
+						(payload) => {
+							this.handleRealtimeEvent(payload, project.id).catch((err) => {
+								logger.error("realtime", `handler error`, {
+									projectId: project.id,
+									error: err instanceof Error ? err.message : String(err),
+								});
+							});
+						},
+					),
+				onStatus: (state) => {
+					const target: ProjectStatusState =
+						state === "up" ? "synced" : state === "retrying" ? "degraded" : "error";
+					this.host.pool.updateStatus(project.id, target, `realtime ${state}`);
 				},
-				(payload) => {
-					this.handleRealtimeEvent(payload).catch((err) => {
-						console.error(
-							"Supabase jump: Realtime handler error",
-							err,
-						);
-						new Notice(
-							`Supabase jump: Realtime handler error - ${err instanceof Error ? err.message : String(err)}`,
-						);
-					});
-				},
-			)
-			.subscribe((status: string) => {
-				if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
-					console.error(
-						`Supabase jump: Realtime channel ${status.toLowerCase()} - reconnecting in ${REALTIME_RECONNECT_MS / 1000}s`,
-					);
-					this.host.setStatus("error");
-					new Notice(
-						`Supabase jump: Realtime disconnected - reconnecting in ${REALTIME_RECONNECT_MS / 1000}s…`,
-					);
-					if (this.realtimeReconnectTimer !== null) return;
-					this.realtimeReconnectTimer = window.setTimeout(() => {
-						this.realtimeReconnectTimer = null;
-						if (!this.client) return;
-						void this.client.removeAllChannels().then(() => {
-							this.startRealtimeListener();
-						});
-					}, REALTIME_RECONNECT_MS);
-				} else if (status === "SUBSCRIBED") {
-					this.host.setStatus("synced");
-				}
+				onJwtExpired: () => this.host.pool.refreshSession(project.id),
 			});
+
+			this.realtimeChannels.set(project.id, supervised);
+		}
 	}
 
-	private async handleRealtimeEvent(payload: {
-		eventType: string;
-		new: Partial<VaultFileRow>;
-		old: Partial<VaultFileRow>;
-	}): Promise<void> {
+	stopRealtimeListeners(): void {
+		for (const ch of this.realtimeChannels.values()) ch.stop();
+		this.realtimeChannels.clear();
+	}
+
+	private async handleRealtimeEvent(
+		payload: { eventType: string; new: Partial<VaultFileRow>; old: Partial<VaultFileRow> },
+		projectId: string,
+	): Promise<void> {
 		const { eventType, new: newRow, old: oldRow } = payload;
 
 		if (eventType === "DELETE") {
@@ -704,41 +700,38 @@ export class SyncEngine {
 			return;
 		}
 
-		// While a CRDT broadcast session is active, Yjs handles merging;
-		// a raw DB pull here would overwrite the correctly merged editor state.
 		if (this.crdtIsActive?.(row.path)) return;
 
 		const localMtime = await this.getLocalMtime(row.path);
 		if (row.mtime > localMtime && this.shouldPull(row)) {
-			await this.pullFile(row);
+			await this.pullFile(row, projectId);
 		}
 	}
 
 	private async deleteLocalFile(path: string): Promise<void> {
 		const file = this.host.vault.getAbstractFileByPath(path);
 		const targetPath = file?.path ?? path;
-		const exists =
-			file !== null || (await this.host.vault.adapter.exists(path));
+		const exists = file !== null || (await this.host.vault.adapter.exists(path));
 		if (!exists) return;
 		this.markIgnore(path);
 		try {
 			await this.host.vault.adapter.trashLocal(targetPath);
 		} catch (err) {
-			console.warn(
-				`Supabase jump: deleteLocalFile failed for "${path}"`,
-				err,
-			);
+			logger.warn("sync", `deleteLocalFile failed for "${path}"`, {
+				error: err instanceof Error ? err.message : String(err),
+			});
 		}
 	}
 
 	startConfigWatcher(): void {
 		if (this.configWatcherId !== null) return;
-
-		this.warmConfigCache().catch(() => { });
+		this.warmConfigCache().catch(() => {});
 
 		this.configWatcherId = window.setInterval(() => {
 			this.pollConfigDir().catch((err) =>
-				console.error("Supabase jump: Config watcher error", err),
+				logger.error("sync", `config watcher error`, {
+					error: err instanceof Error ? err.message : String(err),
+				}),
 			);
 		}, CONFIG_WATCH_MS);
 	}
@@ -754,7 +747,6 @@ export class SyncEngine {
 	private async pollConfigDir(): Promise<void> {
 		const paths = await this.listAdapterFiles(this.host.vault.configDir);
 		const seen = new Set<string>();
-
 		for (const p of paths) {
 			seen.add(p);
 			if (this.ignorePaths.has(p) || this.shouldSkip(p)) continue;
@@ -766,7 +758,6 @@ export class SyncEngine {
 				this.queueChange(p, "push");
 			}
 		}
-
 		for (const [p] of this.configFileCache) {
 			if (!seen.has(p)) {
 				this.configFileCache.delete(p);
@@ -779,32 +770,31 @@ export class SyncEngine {
 		const { syncIntervalMinutes } = this.host.settings;
 		if (syncIntervalMinutes <= 0) return;
 
-		this.syncIntervalId = window.setInterval(
-			() => {
-				void this.fullSync().catch((err) =>
-					console.error("Supabase jump: Auto-sync error", err),
-				);
-			},
-			syncIntervalMinutes * 60 * 1000,
-		);
+		this.syncIntervalId = window.setInterval(() => {
+			void this.fullSync().catch((err) =>
+				logger.error("sync", `auto-sync failed`, {
+					error: err instanceof Error ? err.message : String(err),
+				}),
+			);
+		}, syncIntervalMinutes * 60 * 1000);
 	}
 
 	queueChange(path: string, type: "push" | "delete"): void {
 		if (this.shouldSkip(path) || this.ignorePaths.has(path)) return;
-
 		this.changeQueue.set(path, type);
-
 		if (this.flushTimer !== null) window.clearTimeout(this.flushTimer);
 		this.flushTimer = window.setTimeout(() => {
 			this.flushQueue().catch((err) =>
-				console.error("Supabase jump: Queue flush error", err),
+				logger.error("sync", `flush failed`, {
+					error: err instanceof Error ? err.message : String(err),
+				}),
 			);
 		}, DEBOUNCE_MS);
 	}
 
 	private async flushQueue(): Promise<void> {
 		this.flushTimer = null;
-		if (!this.host.supabase) return;
+		if (this.host.pool.enabledProjectCount() === 0) return;
 
 		const entries = [...this.changeQueue.entries()];
 		this.changeQueue.clear();
@@ -816,12 +806,10 @@ export class SyncEngine {
 					if (file instanceof TFile) {
 						await this.pushFile(file);
 					} else {
-						const userId = await this.getUserId();
-						await this.pushAdapterFile(
-							path,
-							userId,
-							this.host.settings.vaultId,
-						);
+						const rt = this.host.pool.forFile(path);
+						if (!rt) continue;
+						const userId = await this.userIdFor(rt.id);
+						await this.pushAdapterFile(path, userId, this.host.settings.vaultId, rt.client);
 					}
 				} else {
 					await this.deleteRemoteFile(path);
@@ -845,10 +833,7 @@ export class SyncEngine {
 			window.clearTimeout(this.flushTimer);
 			this.flushTimer = null;
 		}
-		if (this.realtimeReconnectTimer !== null) {
-			window.clearTimeout(this.realtimeReconnectTimer);
-			this.realtimeReconnectTimer = null;
-		}
+		this.stopRealtimeListeners();
 		this.changeQueue.clear();
 		this.configFileCache.clear();
 		this.ignorePaths.clear();

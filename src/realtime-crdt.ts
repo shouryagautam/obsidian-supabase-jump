@@ -1,6 +1,10 @@
 import * as Y from "yjs";
 import { Plugin, TFile, WorkspaceLeaf, Editor, MarkdownView } from "obsidian";
-import { SupabaseClient, RealtimeChannel } from "@supabase/supabase-js";
+import { RealtimeChannel } from "@supabase/supabase-js";
+import { ProjectClientPool } from "./project-client-pool";
+import { superviseChannel, SupervisedChannel } from "./realtime-supervisor";
+import { RealtimeTuning } from "./settings";
+import { logger } from "./logger";
 
 interface CRDTPayload {
 	payload: {
@@ -11,9 +15,12 @@ interface CRDTPayload {
 
 export class RealtimeCrdtManager {
 	private plugin: Plugin;
-	private supabase: SupabaseClient | null = null;
+	private pool: ProjectClientPool | null = null;
 	private vaultId: string | null = null;
+	private tuning: RealtimeTuning | null = null;
 	private activeChannel: RealtimeChannel | null = null;
+	private supervised: SupervisedChannel | null = null;
+	private activeProjectId: string | null = null;
 
 	private ydoc: Y.Doc | null = null;
 	private ytext: Y.Text | null = null;
@@ -25,12 +32,12 @@ export class RealtimeCrdtManager {
 		this.plugin = plugin;
 	}
 
-	setSupabase(client: SupabaseClient | null, vaultId: string) {
-		this.supabase = client;
+	configure(pool: ProjectClientPool | null, vaultId: string, tuning: RealtimeTuning) {
+		this.pool = pool;
 		this.vaultId = vaultId;
+		this.tuning = tuning;
 	}
 
-	/** Returns true while the given path is open in an active CRDT session. */
 	isActiveFile(path: string): boolean {
 		return this.activeFile?.path === path;
 	}
@@ -38,7 +45,11 @@ export class RealtimeCrdtManager {
 	start() {
 		this.plugin.registerEvent(
 			this.plugin.app.workspace.on("active-leaf-change", (leaf) => {
-				this.handleLeafChange(leaf).catch(console.error);
+				this.handleLeafChange(leaf).catch((err) =>
+					logger.error("crdt", `leaf change handler threw`, {
+						error: err instanceof Error ? err.message : String(err),
+					}),
+				);
 			}),
 		);
 		this.plugin.registerEvent(
@@ -56,13 +67,17 @@ export class RealtimeCrdtManager {
 	private async handleLeafChange(leaf: WorkspaceLeaf | null) {
 		this.leaveCurrentChannel();
 
-		if (!leaf || !this.supabase || !this.vaultId) return;
+		if (!leaf || !this.pool || !this.vaultId || !this.tuning) return;
 
 		const view = leaf.view;
 		if (!(view instanceof MarkdownView)) return;
 
 		const file = view.file;
 		if (!file || file.extension !== "md") return;
+
+		const rt = this.pool.forFile(file.path);
+		if (!rt) return;
+		this.activeProjectId = rt.id;
 
 		this.activeEditor = view.editor;
 		if (!this.activeEditor) return;
@@ -71,17 +86,13 @@ export class RealtimeCrdtManager {
 		this.ydoc = new Y.Doc();
 		this.ytext = this.ydoc.getText("content");
 
-		const content = await this.getFreshContent(file);
+		const content = await this.getFreshContent(file, rt.id);
 		this.ydoc.transact(() => {
 			this.ytext!.insert(0, content);
 		}, "init");
 
 		this.ytext.observe((event) => {
-			if (
-				event.transaction.origin === "local" ||
-				event.transaction.origin === "init"
-			)
-				return;
+			if (event.transaction.origin === "local" || event.transaction.origin === "init") return;
 			this.patchEditorFromYjs();
 		});
 
@@ -91,71 +102,67 @@ export class RealtimeCrdtManager {
 		});
 
 		const channelId = `doc-${this.vaultId}-${btoa(encodeURIComponent(file.path)).replace(/=+$/, "")}`;
-		this.activeChannel = this.supabase.channel(channelId);
 
-		this.activeChannel.on(
-			"broadcast",
-			{ event: "yjs-update" },
-			(payload: unknown) => {
-				this.handleIncomingUpdate(payload as CRDTPayload);
-			},
-		);
-
-		this.activeChannel.on(
-			"broadcast",
-			{ event: "sync-step-1" },
-			(payload: unknown) => {
-				if (!this.ydoc) return;
-				const p = payload as CRDTPayload;
-				if (!p.payload.stateVector) return;
-				const sv = new Uint8Array(p.payload.stateVector);
-				const update = Y.encodeStateAsUpdate(this.ydoc, sv);
-				void this.activeChannel?.send({
-					type: "broadcast",
-					event: "sync-step-2",
-					payload: { update: Array.from(update) },
+		this.supervised = superviseChannel({
+			scope: `crdt:${rt.id.slice(0, 6)}`,
+			label: `co-edit ${file.path}`,
+			tuning: this.tuning,
+			client: rt.client,
+			build: (client) => {
+				const ch = client.channel(channelId);
+				ch.on("broadcast", { event: "yjs-update" }, (payload: unknown) => {
+					this.handleIncomingUpdate(payload as CRDTPayload);
 				});
+				ch.on("broadcast", { event: "sync-step-1" }, (payload: unknown) => {
+					if (!this.ydoc) return;
+					const p = payload as CRDTPayload;
+					if (!p.payload.stateVector) return;
+					const sv = new Uint8Array(p.payload.stateVector);
+					const update = Y.encodeStateAsUpdate(this.ydoc, sv);
+					void ch.send({
+						type: "broadcast",
+						event: "sync-step-2",
+						payload: { update: Array.from(update) },
+					});
+				});
+				ch.on("broadcast", { event: "sync-step-2" }, (payload: unknown) => {
+					if (!this.ydoc) return;
+					const p = payload as CRDTPayload;
+					if (!p.payload.update) return;
+					Y.applyUpdate(this.ydoc, new Uint8Array(p.payload.update), "remote");
+				});
+				this.activeChannel = ch;
+				return ch;
 			},
-		);
-
-		this.activeChannel.on(
-			"broadcast",
-			{ event: "sync-step-2" },
-			(payload: unknown) => {
-				if (!this.ydoc) return;
-				const p = payload as CRDTPayload;
-				if (!p.payload.update) return;
-				Y.applyUpdate(this.ydoc, new Uint8Array(p.payload.update), "remote");
-			},
-		);
-
-		this.activeChannel.subscribe((status: string) => {
-			if (status === "SUBSCRIBED" && this.ydoc) {
+			onSubscribed: () => {
+				if (!this.ydoc || !this.activeChannel) return;
 				const sv = Y.encodeStateVector(this.ydoc);
-				void this.activeChannel?.send({
+				void this.activeChannel.send({
 					type: "broadcast",
 					event: "sync-step-1",
 					payload: { stateVector: Array.from(sv) },
 				});
-			}
+			},
+			onJwtExpired: () => (this.pool && this.activeProjectId)
+				? this.pool.refreshSession(this.activeProjectId)
+				: Promise.resolve(false),
 		});
 	}
 
-	// Fetch whichever is newer: local disk or DB row.
-	// Avoids seeding Yjs from a stale file when the peer already synced to DB
-	// but the local realtime pull hasn't fired yet.
-	private async getFreshContent(file: TFile): Promise<string> {
+	private async getFreshContent(file: TFile, projectId: string): Promise<string> {
 		const diskContent = await this.plugin.app.vault.read(file);
 		const diskMtime = file.stat.mtime;
 
 		try {
+			const rt = this.pool?.getRuntime(projectId);
+			if (!rt) return diskContent;
 			const rowId = `${this.vaultId!}::${file.path.replace(/\//g, "__SLASH__")}`;
-			const { data } = await this.supabase!
+			const { data } = await rt.client
 				.from("vault_files")
 				.select("content, mtime")
 				.eq("id", rowId)
 				.eq("deleted", false)
-				.single<{ content: string | null; mtime: number }>();
+				.maybeSingle<{ content: string | null; mtime: number }>();
 
 			if (data && data.content !== null && data.mtime > diskMtime) {
 				if (this.activeEditor) {
@@ -165,12 +172,14 @@ export class RealtimeCrdtManager {
 				try {
 					await this.plugin.app.vault.modify(file, data.content);
 				} catch {
-					// Non-fatal – editor already shows correct content
+					// Non-fatal — editor already has correct content
 				}
 				return data.content;
 			}
-		} catch {
-			// Non-fatal – fall back to disk content
+		} catch (err) {
+			logger.debug("crdt", `getFreshContent fallback to disk`, {
+				error: err instanceof Error ? err.message : String(err),
+			});
 		}
 
 		return diskContent;
@@ -262,10 +271,7 @@ export class RealtimeCrdtManager {
 		}, "local");
 	}
 
-	private offsetToPos(
-		text: string,
-		offset: number,
-	): { line: number; ch: number } {
+	private offsetToPos(text: string, offset: number): { line: number; ch: number } {
 		let line = 0;
 		let ch = 0;
 		for (let i = 0; i < offset; i++) {
@@ -280,23 +286,23 @@ export class RealtimeCrdtManager {
 	}
 
 	private leaveCurrentChannel() {
-		// Persist the Yjs-merged state to disk before tearing down so that
-		// mtime-based conflict resolution sees up-to-date content on next sync.
 		if (this.activeFile && this.ytext) {
 			void this.plugin.app.vault
 				.modify(this.activeFile, this.ytext.toJSON())
 				.catch(() => {});
 		}
 
-		if (this.activeChannel) {
-			void this.activeChannel.unsubscribe();
-			this.activeChannel = null;
+		if (this.supervised) {
+			this.supervised.stop();
+			this.supervised = null;
 		}
+		this.activeChannel = null;
 		this.ydoc?.destroy();
 		this.ydoc = null;
 		this.ytext = null;
 		this.activeFile = null;
 		this.activeEditor = null;
+		this.activeProjectId = null;
 		this.suppressNextEditorChange = 0;
 	}
 }

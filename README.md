@@ -1,7 +1,7 @@
 # <div align="center">SupaBase Jump for Obsidian</div>
 
 <div align="center">
-Sync your Obsidian vault with Supabase in real time. Edit the same note on two devices simultaneously, keep platform-specific settings separate, and access your notes from anywhere.
+Sync your Obsidian vault with one or many Supabase projects. Edit the same note on two devices simultaneously. Pool multiple free-tier projects to extend storage past 500 MB. Built-in diagnostics make connection issues debuggable from settings instead of the dev console.
 </div>
 
 <br />
@@ -24,280 +24,280 @@ Sync your Obsidian vault with Supabase in real time. Edit the same note on two d
 
 > If the video is blurry, you can [download it here](assets/video-demo.mp4).
 
+## What's new in v2
+
+- **Multi-project sharding.** Add one or more Supabase projects in settings. Files are deterministically routed to a project by a stable hash of the path, so the same path always lands on the same shard. Capacity scales with the number of free-tier projects you add.
+- **Setup wizard.** A guided modal walks through Project URL + anon key, runs the schema setup as labelled SQL fragments via the Management API, creates the storage bucket, signs you in, and verifies the project is usable with a round-trip probe. Each step reports HTTP status and response body on failure with a "retry just this step" button.
+- **Magic-link auth.** Optional one-time-code sign-in per project — no password stored. Password auth is still supported and now wraps the password with an at-rest obfuscation (vault-id-derived XOR; see security notes).
+- **Adaptive realtime.** Reconnects with exponential backoff + jitter. Brief outages are silent — a user notice only fires after the channel has been down for `escalateAfterMs` (default 30 s). JWT-expired errors trigger a session refresh before a Notice.
+- **Diagnostics in-plugin.** Structured log buffer, level dropdown in settings, "Open log panel" command with live filtering, "Copy diagnostics" button that redacts URLs and tokens.
+- **Rebalance command.** When you add or disable a project, run "Rebalance projects" to move rows + storage objects to their correct shards.
+
 ## Features
 
-- **Real-time collaborative editing** - Two devices sharing the same account can edit the same note at the same time. Yjs CRDTs handle merging automatically; updates broadcast instantly as you type with no duplication.
-- **Real-time sync** - Changes propagate across all your devices via Supabase Realtime
-- **Conflict resolution** - Newer files always win (based on modification time)
-- **Binary file support** - Images, PDFs, and other attachments sync via Supabase Storage
-- **Frontmatter parsing** - Properties and tags from markdown frontmatter are stored in dedicated columns for SQL querying
-- **Selective sync** - Exclude specific folders from syncing
-- **Settings sync** - The `.obsidian/` folder syncs automatically to share themes, snippets, and plugin settings across devices
-- **Platform-specific config** - Choose which config files sync only to mobile or only to desktop (e.g. keep separate themes or plugin lists per platform)
-- **Self-hosted support** - Works with any Supabase-compatible instance, not just supabase.com
-- **Mobile compatible** - Works on both desktop and mobile Obsidian
-- **One-click setup** - Automated database and storage configuration
-- **Offline-first** - Local changes are queued and synced when you reconnect
+- Real-time collaborative editing (Yjs CRDTs over Supabase Broadcast)
+- Real-time database sync via Supabase Realtime
+- Conflict resolution by modification time (last-write-wins outside CRDT sessions)
+- Binary files via Supabase Storage; text files inline in Postgres
+- Frontmatter properties + tags extracted into queryable columns
+- Selective sync (excluded folders, platform-specific paths)
+- `.obsidian/` config folder sync
+- Self-hosted Supabase support
+- Mobile + desktop
+- Offline queueing
 
 ## Quick Start
 
-### 1. Create a Supabase Project
+### 1. Create one or more Supabase projects
 
-1. Go to [supabase.com](https://supabase.com) and create a free account
-2. Create a new project
-3. Copy your **Project URL** and **anon/public key** from **Settings → API**
+Create at least one free project at [supabase.com](https://supabase.com). For each one, copy:
 
-### 2. Install the Plugin
+- **Project URL** (`https://<ref>.supabase.co`)
+- **Anon/public key** (Project Settings → API)
 
-The plugin is pending review in the community plugin store. Install it via **BRAT** (recommended) or manually in the meantime.
+You only need a **Personal Access Token** (account-level, see [supabase.com/dashboard/account/tokens](https://supabase.com/dashboard/account/tokens)) for the one-time setup. The wizard uses it once, never stores it.
 
-#### Install via BRAT (Recommended)
+### 2. Install
 
-[BRAT](https://github.com/TfTHacker/obsidian42-brat) lets you install and auto-update beta plugins directly from GitHub.
+Install via [BRAT](https://github.com/TfTHacker/obsidian42-brat):
 
-1. Install the **BRAT** plugin from the Obsidian Community Plugins store
-2. Open **Settings → BRAT → Add Beta Plugin**
-3. Paste the repo URL: `https://github.com/brianstm/obsidian-supabase-jump`
-4. Click **Add Plugin** - BRAT will install it and keep it up to date automatically
+1. Install BRAT from the Community Plugins store.
+2. **Settings → BRAT → Add Beta Plugin** → paste `https://github.com/brianstm/obsidian-supabase-jump`.
 
-#### Manual Installation
+Or manually:
 
-1. Download `main.js` and `manifest.json` from the [latest release](https://github.com/brianstm/obsidian-supabase-jump/releases)
-2. Create a folder: `<vault>/.obsidian/plugins/supabase-jump/`
-3. Copy the files into that folder
-4. Reload Obsidian and enable the plugin in **Settings → Community plugins**
+1. Download `main.js` and `manifest.json` from the latest release.
+2. Drop them into `<vault>/.obsidian/plugins/supabase-jump/`.
+3. Reload Obsidian and enable the plugin.
 
-### 3. Configure the Plugin
+### 3. Run the setup wizard
 
-1. Open **Settings → SupaBase Jump**
-2. In the **Initial setup** section:
-    - Generate a **Personal Access Token** at [supabase.com/dashboard/account/tokens](https://supabase.com/dashboard/account/tokens)
-    - Paste it into the **Personal access token** field
-    - Click **Run full setup** - this creates the database table, storage bucket, and enables Realtime
-3. Fill in your credentials:
-    - **Project URL** - Your Supabase project URL (e.g. `https://xxxxx.supabase.co`)
-    - **Anon/public key** - Your anon/public key
-    - **Email** - Your Supabase account email
-    - **Password** - Your Supabase account password
-4. Click **Connect**
+Open **Settings → SupaBase Jump → Open wizard**. The wizard walks through, per project:
 
-That's it! Your vault will start syncing automatically.
+1. **Credentials.** Paste Project URL + anon key + a project label.
+2. **Schema setup.** Paste a PAT and click "Run schema setup". The wizard runs seven labelled SQL steps; any failure shows the exact HTTP status, request URL, and response body, and gives you a per-step retry button.
+3. **Storage bucket.** Click "Create / verify" — creates the `vault-attachments` bucket via the Management API. If creation fails (e.g. some self-hosted setups), create it manually and click "Create / verify" to confirm.
+4. **Authentication.** Pick email + password OR magic-link OTP. Magic-link sends a 6-digit code to your inbox; paste it back.
+5. **Verify.** Round-trips a tiny row to confirm RLS + bucket + auth are wired correctly.
+6. **Save project.** The project is appended to settings and connection starts.
+
+To add a second project: settings → "Add project". Run the wizard again. Then click **"Rebalance now"** to redistribute existing files across the new shard set.
 
 ## Usage
 
-### Automatic Sync
+### Status bar
 
-Once connected, the plugin automatically:
+The status bar shows the aggregate state across all enabled projects:
 
-- Pushes local changes to Supabase (debounced by 1 second)
-- Pulls remote changes from other devices in real time
-- Syncs on startup (if **Sync on startup** is enabled)
-- Syncs periodically based on your **Sync interval** setting
+| Icon | Meaning |
+|------|---------|
+| 🟢 | All projects synced |
+| 🟡 | One or more projects connecting |
+| 🔄 | A sync is in progress |
+| 🟠 | One or more projects degraded (realtime offline, retrying) |
+| ⚠️  | One or more projects in error state |
+| 🔴 | All projects offline |
 
-### Real-Time Collaborative Editing
+Hover or run the **Show sync status** command to see the full `N/M synced` label.
 
-When two devices open the same markdown note, they join an ephemeral Supabase Realtime channel for that file. Edits are merged using [Yjs](https://github.com/yjs/yjs) CRDTs. Changes appear on the other device instantly as you type, with no full-document replacement or text duplication. The Yjs state is kept only in memory; once you close the note the channel is released and normal `mtime`-based conflict resolution takes over.
+### Multi-project routing
 
-### Platform-Specific Config Paths
+Files are routed to a project by `hash(path) % enabledProjects.length`, using a random salt generated on first install. Same path → same project, deterministically, until you add, remove, or disable a project. Then run **Rebalance projects** to move files to their new shards.
 
-In **Settings → Platform-specific config paths**, toggle which Obsidian config files should sync only to the current platform (mobile or desktop):
+The catalog (`vault_files` table) lives in each project; the bucket lives in each project. There is no single "metadata project" — each project is fully independent.
 
-| Toggle                 | Path                     | Example use                    |
-| ---------------------- | ------------------------ | ------------------------------ |
-| Appearance             | `appearance.json`        | Different theme on mobile      |
-| Themes folder          | `themes/`                | Mobile-only themes             |
-| CSS Snippets           | `snippets/`              | Mobile/desktop-only CSS        |
-| All plugins            | `plugins/`               | Desktop-only plugin data       |
-| Installed plugins list | `community-plugins.json` | Different plugins per platform |
-| Custom hotkeys         | `hotkeys.json`           | Different shortcuts on mobile  |
-| Workspace layout       | `workspace.json`         | Different pane layout          |
+### Diagnostics
 
-Use the **Custom paths** field to add any other paths not listed above.
+When something goes wrong:
 
-When a file matches a platform-specific path, it is tagged in the database (`platform = 'mobile'` or `platform = 'desktop'`). Pull operations skip rows tagged for a different platform.
+1. **Settings → SupaBase Jump → Diagnostics → Open log panel.** Live-updating ring buffer (last 1000 entries by default), level filter, scope filter.
+2. **Copy diagnostics.** Copies a redacted text bundle (logs + plugin meta + settings with URLs/keys redacted) to the clipboard. Paste into a GitHub issue.
 
-### Manual Sync
+The default log level is `info`. Switch to `debug` to see push/pull events per file when debugging sync issues.
 
-Use the **Actions** section in settings:
+### Realtime tuning
 
-- **Sync now** - Full two-way sync (push + pull)
-- **Fetch now** - Pull remote changes without pushing local files
+In Settings → Diagnostics:
 
-Or use the command palette:
+- **Realtime escalate-after (seconds).** How long a realtime channel must stay down before showing a user notice. Default 30 s — brief flaps (WiFi switch, sleep/wake) don't surface a Notice.
 
-- `SupaBase Jump: Force sync now`
-- `SupaBase Jump: Fetch from database`
-- `SupaBase Jump: Show sync status`
+In `data.json` you can also tune `realtime.reconnectInitialMs` (default 1000) and `realtime.reconnectMaxMs` (default 60000) for backoff bounds.
 
-### Exclude Folders
+### Real-time collaborative editing
 
-To exclude folders from syncing, add them to **Excluded folders** (comma-separated) in settings.
+When two devices open the same `.md` file, they join an ephemeral Supabase Broadcast channel for that file (on whichever project the file is sharded to). Edits merge via Yjs CRDTs. State is not persisted to the database — closing the note releases the channel and mtime-based conflict resolution takes over.
 
-Example: `Templates, archive/old`
+### Manual sync
 
-By default no folders are excluded. If you want to prevent vault settings from syncing entirely, add `.obsidian` to your excluded list (or use the platform-specific config paths feature for finer control).
+| Command | Action |
+|---------|--------|
+| `SupaBase Jump: Force sync now` | Full two-way sync across all enabled projects |
+| `SupaBase Jump: Fetch from database` | Pull-only sync |
+| `SupaBase Jump: Show sync status` | Print aggregate status to a Notice |
+| `SupaBase Jump: Open log panel` | Open the log buffer view |
+| `SupaBase Jump: Open setup wizard` | Add a new project |
+| `SupaBase Jump: Copy diagnostics to clipboard` | Export redacted diagnostics |
+| `SupaBase Jump: Rebalance projects` | Re-shard files after a project set change |
 
-### Self-Hosted Supabase
+### Platform-specific config paths
 
-The plugin works with any Supabase-compatible URL. Enter your self-hosted instance URL in the **Project URL** field. Note that the one-click setup uses the Supabase cloud management API, so for self-hosted instances you will need to run the SQL manually using the guide in the settings panel.
+In settings → Platform-specific config paths, toggle which `.obsidian/` files sync only to mobile vs only to desktop. Useful for keeping different themes, plugin sets, or hotkeys per platform.
+
+| Toggle | Path |
+|--------|------|
+| Appearance | `appearance.json` |
+| Themes folder | `themes/` |
+| CSS Snippets | `snippets/` |
+| All plugins | `plugins/` |
+| Installed plugins list | `community-plugins.json` |
+| Custom hotkeys | `hotkeys.json` |
+| Workspace layout | `workspace.json` |
+
+Rows for platform-tagged files carry `platform = 'mobile'` or `'desktop'`; pulls skip rows tagged for a different platform.
+
+### Self-hosted Supabase
+
+Each project in the wizard can target any Supabase-compatible URL. The Management API steps require `api.supabase.com` reachability with your PAT; self-hosted setups that don't expose this can paste the SQL from the wizard transcript into your own SQL editor and skip the bucket-creation step (create the bucket manually instead).
+
+Magic-link auth requires SMTP to be configured in your Supabase project; if you're self-hosting without SMTP, pick password auth for that project.
 
 ## How It Works
 
-### Architecture
+### Database schema
 
-- **Text files** (`.md`, `.txt`, etc.) - Content stored directly in the `vault_files` PostgreSQL table
-- **Binary files** (images, PDFs, etc.) - Uploaded to Supabase Storage; metadata in `vault_files`
-- **Database sync** - Supabase Realtime broadcasts row changes to all connected clients for file-level sync
-- **Live editing sync** - A per-file Supabase Broadcast channel carries Yjs CRDT updates for same-note co-editing
-- **Conflict resolution** - Higher `mtime` (modification time) wins for file-level sync; Yjs handles in-session edits automatically
+Each project carries the same `vault_files` table:
 
-### Database Schema
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | text (PK) | `{vaultId}::{path}` with slashes → `__SLASH__` |
+| `vault_id` | text | Vault identifier; same across projects |
+| `path` | text | Relative file path |
+| `content` | text | Text body (text files) |
+| `storage_path` | text | Storage key (binary files) |
+| `frontmatter` | jsonb | Parsed YAML frontmatter |
+| `tags` | text[] | Tags extracted from `tags:` |
+| `platform` | text | `all` / `mobile` / `desktop` |
+| `mtime`/`ctime`/`size` | bigint | File metadata |
+| `deleted` | boolean | Soft-delete |
+| `user_id` | uuid | RLS scope key |
 
-The plugin creates a `vault_files` table with:
+`user_id` is per-project — each project's auth.uid() is independent. The plugin uses `pool.getUserId(projectId)` whenever it needs the right one.
 
-| Column                   | Type      | Description                                       |
-| ------------------------ | --------- | ------------------------------------------------- |
-| `id`                     | text (PK) | `{vaultId}::{filePath}` (slashes → `__SLASH__`)   |
-| `vault_id`               | text      | Unique ID for your vault                          |
-| `path`                   | text      | File path relative to vault root                  |
-| `content`                | text      | File content (text files only)                    |
-| `storage_path`           | text      | Supabase Storage key (binary files only)          |
-| `frontmatter`            | jsonb     | All YAML frontmatter properties                   |
-| `tags`                   | text[]    | Tags extracted from the `tags:` frontmatter field |
-| `platform`               | text      | `'all'`, `'mobile'`, or `'desktop'`               |
-| `mtime`, `ctime`, `size` | bigint    | File metadata                                     |
-| `deleted`                | boolean   | Soft-delete flag                                  |
-| `user_id`                | uuid      | Used by RLS to scope rows to each user            |
+### Storage bucket
 
-### Querying Frontmatter from Supabase
+Each project has a private `vault-attachments` bucket. Binary files are uploaded to `{userId}/{vaultId}/{base64url(path)}{ext}`. The RLS policy on `storage.objects` requires the first folder segment to match the requesting user.
 
-Once notes are synced you can query them directly from the Supabase SQL editor or any Postgres client:
+### Routing
 
-```sql
--- All notes tagged "book"
-SELECT path, frontmatter->>'title', tags
-FROM vault_files
-WHERE 'book' = ANY(tags) AND deleted = false;
-
--- Notes where status is not "done"
-SELECT path, frontmatter->>'status'
-FROM vault_files
-WHERE frontmatter->>'status' != 'done' AND deleted = false;
-
--- Notes by a specific author, sorted by date
-SELECT path, frontmatter->>'date'
-FROM vault_files
-WHERE frontmatter->>'author' = 'Alice'
-ORDER BY frontmatter->>'date' DESC;
-
--- Count notes per tag
-SELECT tag, COUNT(*)
-FROM vault_files, unnest(tags) AS tag
-WHERE deleted = false
-GROUP BY tag ORDER BY count DESC;
-
--- Desktop-only config files
-SELECT path FROM vault_files
-WHERE platform = 'desktop' AND deleted = false;
+```
+shardFor(path, projects, salt) = enabledProjects[fnv1a(salt + ":" + path) % enabledProjects.length]
 ```
 
-### Storage Bucket
+`enabledProjects` is sorted by id, so the routing is stable across devices as long as the project set + salt are identical. Adding/removing/disabling projects changes the modulo and requires a rebalance.
 
-Binary files are stored in a private `vault-attachments` bucket with:
+### Realtime
 
-- RLS policies ensuring users can only access their own files
-- Base64url-encoded keys to handle special characters in filenames
-- Original file extensions preserved for MIME type inference
+One `postgres_changes` subscription per enabled project on the `vault_files` table filtered by `vault_id`. Each subscription is managed by `RealtimeSupervisor`:
+
+- `CHANNEL_ERROR` / `TIMED_OUT` / `CLOSED` → exponential backoff with ±20% jitter, capped at `reconnectMaxMs`.
+- JWT expired (PGRST301 / message contains "JWT expired") → call `refreshSession()` once, then re-subscribe without backoff.
+- Sustained outage > `escalateAfterMs` → user Notice; status bar already shows degraded immediately.
+
+Per-file CRDT broadcast channels use the same supervisor — transient errors no longer surface a Notice.
+
+### Diagnostics
+
+`logger.ts` exposes a ring buffer (default 1000 entries) and four levels. Settings → Log level controls verbosity. `exportDiagnostics` produces a redacted text bundle: URLs are reduced to host+path, keys/tokens are masked, errors are stringified with stack trace truncated to 8 lines.
 
 ## Troubleshooting
 
-### "Setup failed at step 1/2/3"
+### "Setup failed at step …"
 
-- **Step 1 (Database)** - Check your Personal Access Token is valid and has the required permissions
-- **Step 2 (Storage bucket)** - If auto-creation fails, manually create a bucket named `vault-attachments` (Private) in **Supabase → Storage**
-- **Step 3 (RLS policy)** - Ensure your Supabase project has the `storage` schema enabled
+Open the wizard transcript for that project. Each SQL step is labelled with HTTP status + response body. Common causes:
 
-### "Email not confirmed"
+- **`create-table` / `create-policy` → 401 / 403:** PAT lacks permission on the project, or you pasted the anon key instead of a PAT. Generate a fresh PAT at [supabase.com/dashboard/account/tokens](https://supabase.com/dashboard/account/tokens).
+- **`add-publication` → 42710 (publication already has table):** harmless — the DO block should swallow this; if it didn't, the wizard's per-step retry will succeed on the next attempt.
+- **`storage-rls` → 42501 (insufficient privilege):** the project's `storage` schema is locked down by a hosting provider. Create the policy manually in the Supabase SQL editor using the SQL from the wizard transcript.
 
-If you see this error after connecting:
+### "Connection lost — reconnecting…" used to spam, now silent
 
-1. Check your email inbox for a confirmation link from Supabase
-2. Click the link to confirm your account
-3. Click **Connect** again in the plugin settings
+Brief realtime outages now stay silent until they exceed `escalateAfterMs` (default 30 s). The status bar shows 🟠 immediately; only the Notice is debounced. If you'd rather see Notices sooner, lower **Diagnostics → Realtime escalate-after (seconds)** to 5–10.
 
-Or disable email confirmation:
+### Files not syncing on one device
 
-1. Go to **Supabase → Authentication → Providers → Email**
-2. Uncheck **"Confirm email"**
+1. Status bar should read 🟢. If it shows 🟠 or ⚠️ on one device, open the log panel and filter scope `realtime` — the supervisor logs every reconnect attempt with the underlying status.
+2. Check **Settings → Vault ID** matches across devices.
+3. Compare the project set: both devices must have the same projects + same `routing.hashSalt`. If they don't, paths route to different shards. Easiest fix: re-export `data.json` from the working device or re-add the same projects on the failing device in the same order.
 
-### Files not syncing
+### Magic-link OTP never arrives
 
-1. Check the status bar (bottom-right) - it should show **🟢 Synced**
-2. Open the browser console (**Ctrl+Shift+I** / **Cmd+Option+I**) and look for errors
-3. Verify your **Vault ID** is set in settings
-4. Check that the file path is not in your **Excluded folders** list
-5. Try **Sync now** manually from settings
+Magic-link uses your Supabase project's email SMTP. On self-hosted instances without SMTP, no link/code is sent. Switch the project to password auth in **Edit project → Authentication → Method**.
 
-### Real-time editing not working
+### "Project rejected the query — check RLS policy"
 
-1. Ensure both devices are connected (🟢 Synced in the status bar)
-2. Make sure both devices have the same file open
-3. Check the browser console for channel subscription errors
-4. The CRDT channel only activates for `.md` files in a MarkdownView
+The plugin saw a `42501` (RLS violation) when reading from one project. Run the **storage-rls** and **create-policy** steps for that project in the wizard again, then click **Verify**. If verify passes but live sync still fails, the project's `user_id` column on existing rows may not match `auth.uid()` for the signed-in user — clear those rows and let the plugin re-push.
 
-### "Invalid key" errors
+## Security model
 
-The plugin automatically handles special characters in filenames by base64url-encoding storage keys. If you still see this error:
+- **Vault data stays in your own Supabase projects.** No third-party servers.
+- **Row Level Security** is enforced on every project's `vault_files` table and `storage.objects` bucket; you can only read or write rows scoped to your own `auth.uid()`.
+- **CRDT broadcast channels are ephemeral.** Yjs state is never persisted to the database.
+- **Password storage on disk is obfuscation, not encryption.** Passwords in `data.json` are XOR'd with a vault-id-derived key. Anyone with read access to `data.json` *and* your vault id can recover the password. If this is unacceptable, use magic-link auth (no password stored at all) or a self-hosted Obsidian setup with disk encryption.
+- **Personal Access Tokens are never persisted.** The wizard accepts a PAT just-in-time and discards it as soon as the steps complete.
+- **Diagnostics are redacted before clipboard.** URLs are reduced to host+path; keys/tokens are masked. Inspect the output before sharing in an issue.
+- **No telemetry.** The plugin makes no outbound requests other than to the Supabase projects you configure.
 
-1. Ensure you are running the latest version of the plugin
-2. Check the browser console for the full error message
-3. Report the issue on [GitHub](https://github.com/brianstm/obsidian-supabase-jump/issues) with the filename
+## Migration from v1.x
+
+v1 settings are migrated automatically on first load:
+
+- Old top-level fields (`supabaseUrl`, `supabaseAnonKey`, `email`, `password`, `vaultId`, etc.) are wrapped into a new `projects[0]` entry labelled "Project 1".
+- A random `routing.hashSalt` is generated.
+- The password (if any) is moved out of `data.json` and re-stored as an obfuscated `passwordEncrypted` field.
+- Behavior is unchanged with a single project — `N=1` sharding routes every file to the same project, so no rebalance is needed.
+
+To opt into multi-project sharding, add a second project in settings and run **Rebalance projects**.
 
 ## Development
-
-### Building from Source
 
 ```bash
 git clone https://github.com/brianstm/obsidian-supabase-jump.git
 cd obsidian-supabase-jump
 npm install
-npm run dev
-npm run build
+npm run dev      # watch + rebuild
+npm run build    # tsc --noEmit && esbuild production
+npm run lint
 ```
 
-### Project Structure
+### Project structure
 
 ```
 src/
-├── main.ts            # Plugin entry point and lifecycle management
-├── settings.ts        # Settings interface and UI
-├── supabase.ts        # Supabase client and authentication
-├── sync.ts            # File sync logic and Realtime listeners
-├── realtime-crdt.ts   # Yjs CRDT manager for real-time co-editing
-└── frontmatter.ts     # YAML frontmatter parser
+├── main.ts                 Plugin entry, command/event wiring, host bindings
+├── settings.ts             Settings types, defaults, helpers, settings tab UI
+├── migration.ts            v1 → v2 settings migration
+├── routing.ts              Stable FNV-1a hashing for shardFor()
+├── secret-storage.ts       At-rest password obfuscation
+├── project-client-pool.ts  Multi-project Supabase client lifecycle + auth
+├── realtime-supervisor.ts  Adaptive realtime reconnect with debounced Notices
+├── sync.ts                 Push/pull/full-sync/realtime-event handling
+├── realtime-crdt.ts        Per-file Yjs broadcast over supervised channels
+├── setup-wizard.ts         Wizard modal: labelled SQL steps + auth + verify
+├── log-panel.ts            In-app log buffer viewer
+├── rebalance.ts            Resumable cross-project rebalance task
+├── logger.ts               Ring buffer + redacted diagnostics export
+└── frontmatter.ts          YAML frontmatter parser
 ```
-
-## Privacy & Security
-
-- Your vault data is stored in **your own Supabase project** - not on third-party servers
-- All database access uses **Row Level Security (RLS)** - you can only read and write your own files
-- The CRDT broadcast channel is **ephemeral** - no Yjs state is persisted to the database
-- Passwords are hashed by Supabase Auth - the plugin never stores plaintext passwords
-- No telemetry or analytics - the plugin is fully open source
 
 ## License
 
-MIT - see [LICENSE](LICENSE)
+MIT — see [LICENSE](LICENSE)
 
 ## Support
 
-- **Issues & Feature Requests** - [GitHub Issues](https://github.com/brianstm/obsidian-supabase-jump/issues)
+- **Issues & feature requests:** [GitHub Issues](https://github.com/brianstm/obsidian-supabase-jump/issues)
+- Include the output of **Copy diagnostics to clipboard** with bug reports.
 
 ## Acknowledgments
 
-Built with:
-
-- [Obsidian Plugin API](https://docs.obsidian.md)
-- [Supabase](https://supabase.com)
-- [Supabase JS Client](https://github.com/supabase/supabase-js)
-- [Yjs](https://github.com/yjs/yjs) - CRDT library for real-time collaborative editing
+Built with [Obsidian Plugin API](https://docs.obsidian.md), [Supabase](https://supabase.com), [supabase-js](https://github.com/supabase/supabase-js), and [Yjs](https://github.com/yjs/yjs).

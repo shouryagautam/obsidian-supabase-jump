@@ -6,29 +6,72 @@ import {
 	Setting,
 	TextComponent,
 } from "obsidian";
+import type { LogLevel } from "./logger";
 
-export interface SupaBaseJumpSettings {
+export const SETTINGS_SCHEMA_VERSION = 2;
+
+export type AuthMethod = "password" | "magic_link";
+
+export interface ProjectConfig {
+	id: string;
+	label: string;
 	supabaseUrl: string;
 	supabaseAnonKey: string;
-	personalAccessToken: string;
+	authMethod: AuthMethod;
 	email: string;
-	password: string;
+	// Stored encrypted (see secret-storage.ts). Empty string when authMethod === 'magic_link'.
+	passwordEncrypted: string;
+	enabled: boolean;
+	// Updated after successful sync. Used for the quota readout.
+	lastUsedBytes: number;
+	// Updated after each connect cycle. Used by the status bar.
+	lastConnectedAt: number;
+}
+
+export interface RoutingConfig {
+	strategy: "hash_mod";
+	hashSalt: string;
+}
+
+export interface LoggingConfig {
+	level: LogLevel;
+	bufferSize: number;
+}
+
+export interface RealtimeTuning {
+	reconnectInitialMs: number;
+	reconnectMaxMs: number;
+	escalateAfterMs: number;
+}
+
+export interface SupaBaseJumpSettings {
+	schemaVersion: number;
 	vaultId: string;
+	projects: ProjectConfig[];
+	routing: RoutingConfig;
+	logging: LoggingConfig;
+	realtime: RealtimeTuning;
 	syncOnStartup: boolean;
 	syncConfigFolder: boolean;
 	syncIntervalMinutes: number;
 	excludedFolders: string[];
 	platformExcludedPaths: string[];
 	lastSyncTime: number;
+	// Resumable rebalance progress; absent when no rebalance is queued.
+	rebalanceProgress?: { startedAt: number; movedRowIds: string[] };
 }
 
 export const DEFAULT_SETTINGS: SupaBaseJumpSettings = {
-	supabaseUrl: "",
-	supabaseAnonKey: "",
-	personalAccessToken: "",
-	email: "",
-	password: "",
+	schemaVersion: SETTINGS_SCHEMA_VERSION,
 	vaultId: "",
+	projects: [],
+	routing: { strategy: "hash_mod", hashSalt: "" },
+	logging: { level: "info", bufferSize: 1000 },
+	realtime: {
+		reconnectInitialMs: 1000,
+		reconnectMaxMs: 60000,
+		escalateAfterMs: 30000,
+	},
 	syncOnStartup: false,
 	syncConfigFolder: true,
 	syncIntervalMinutes: 5,
@@ -56,23 +99,16 @@ export function isSystemFile(path: string): boolean {
 }
 
 export const BINARY_EXTENSIONS = new Set([
-	// Images
 	"png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "tiff", "tif",
 	"heic", "heif", "avif",
-	// Audio / video
 	"mp3", "mp4", "wav", "ogg", "m4a", "flac", "aac", "avi", "mov", "mkv",
 	"webm",
-	// Documents / archives
 	"pdf", "zip", "tar", "gz", "bz2", "xz", "7z", "rar",
 	"docx", "xlsx", "pptx", "doc", "xls", "ppt",
-	// Fonts
 	"ttf", "otf", "woff", "woff2", "eot",
-	// Executables / libraries / system
 	"exe", "dll", "dylib", "so", "dmg", "pkg", "deb", "rpm", "apk", "ipa",
 	"class", "jar",
-	// Cryptographic / key material
 	"sig", "key", "p12", "pfx", "cer", "crt", "der", "p7b",
-	// Database / binary data
 	"db", "sqlite", "sqlite3", "bin", "dat", "raw",
 ]);
 
@@ -81,13 +117,10 @@ export function isBinary(path: string): boolean {
 	return BINARY_EXTENSIONS.has(ext);
 }
 
-export function isExcluded(
-	filePath: string,
-	excludedFolders: string[],
-): boolean {
+export function isExcluded(filePath: string, excludedFolders: string[]): boolean {
 	if (excludedFolders.length === 0) return false;
 	return excludedFolders.some((folder) => {
-		const prefix = folder.replace(/\/$/, ""); // strip trailing slash
+		const prefix = folder.replace(/\/$/, "");
 		return filePath === prefix || filePath.startsWith(prefix + "/");
 	});
 }
@@ -98,12 +131,12 @@ export function isPlatformExcluded(
 ): boolean {
 	if (platformExcludedPaths.length === 0) return false;
 	return platformExcludedPaths.some((folder) => {
-		const prefix = folder.replace(/\/$/, ""); // strip trailing slash
+		const prefix = folder.replace(/\/$/, "");
 		return filePath === prefix || filePath.startsWith(prefix + "/");
 	});
 }
 
-const SETUP_SQL = `-- vault_files table
+export const FALLBACK_SETUP_SQL = `-- vault_files table
 CREATE TABLE IF NOT EXISTS vault_files (
   id           text primary key,
   vault_id     text not null,
@@ -111,6 +144,8 @@ CREATE TABLE IF NOT EXISTS vault_files (
   content      text,
   storage_path text,
   is_binary    boolean default false,
+  frontmatter  jsonb,
+  tags         text[],
   mtime        bigint not null,
   ctime        bigint not null,
   size         bigint not null,
@@ -123,6 +158,8 @@ CREATE INDEX IF NOT EXISTS vault_files_vault_path
   ON vault_files(vault_id, path);
 CREATE INDEX IF NOT EXISTS vault_files_vault_mtime
   ON vault_files(vault_id, mtime);
+CREATE INDEX IF NOT EXISTS vault_files_tags
+  ON vault_files USING gin(tags);
 ALTER TABLE vault_files ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "Users manage own vault" ON vault_files FOR ALL
   USING (auth.uid() = user_id)
@@ -135,14 +172,26 @@ ALTER PUBLICATION supabase_realtime ADD TABLE vault_files;
 --   USING  (auth.uid()::text = (storage.foldername(name))[1])
 --   WITH CHECK (same)`;
 
+export interface ProjectStatusView {
+	state: "offline" | "connecting" | "synced" | "syncing" | "error" | "degraded";
+	detail: string;
+}
+
 export interface SettingsTabHost {
 	settings: SupaBaseJumpSettings;
 	saveSettings(): Promise<void>;
-	initSupabase(): Promise<void>;
-	signOut(): Promise<void>;
+	connectAll(): Promise<void>;
+	signOutAll(): Promise<void>;
 	fullSync(): Promise<void>;
 	fetchNow(): Promise<void>;
-	initializeSchema(onProgress: (step: number) => void): Promise<void>;
+	openSetupWizard(mode: "first-run" | "add-project" | "edit-project", projectId?: string): void;
+	openLogPanel(): void;
+	copyDiagnostics(): Promise<void>;
+	rebalanceNow(): Promise<void>;
+	removeProject(projectId: string): Promise<void>;
+	toggleProject(projectId: string, enabled: boolean): Promise<void>;
+	getProjectStatus(projectId: string): ProjectStatusView;
+	getTotalUsageBytes(): number;
 }
 
 export class SupaBaseJumpSettingTab extends PluginSettingTab {
@@ -157,144 +206,53 @@ export class SupaBaseJumpSettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 
-		new Setting(containerEl).setName("Initial setup").setHeading();
+		this.renderHeader(containerEl);
+		this.renderVault(containerEl);
+		this.renderProjects(containerEl);
+		this.renderSyncBehaviour(containerEl);
+		this.renderPlatformPaths(containerEl);
+		this.renderActions(containerEl);
+		this.renderDiagnostics(containerEl);
+	}
 
-		new Setting(containerEl)
-			.setName("Personal access token")
-			.setDesc(
-				"Generate at supabase.com/dashboard/account/tokens. Only needed for the setup step - can be cleared after.",
-			)
-			.addText((text) => {
-				text.setPlaceholder("Sbp_...")
-					.setValue(this.plugin.settings.personalAccessToken)
-					.onChange(async (value) => {
-						this.plugin.settings.personalAccessToken = value.trim();
-						await this.plugin.saveSettings();
-					});
-				text.inputEl.type = "password";
+	private renderHeader(containerEl: HTMLElement): void {
+		new Setting(containerEl).setName("Setup").setHeading();
+
+		const projectCount = this.plugin.settings.projects.length;
+		const enabledCount = this.plugin.settings.projects.filter((p) => p.enabled).length;
+		const totalBytes = this.plugin.getTotalUsageBytes();
+		const totalQuotaMb = this.plugin.settings.projects.length * 500;
+		const usedMb = totalBytes > 0 ? (totalBytes / 1024 / 1024).toFixed(1) : "0";
+
+		const summary = containerEl.createDiv({ cls: "sbj-summary" });
+		if (projectCount === 0) {
+			summary.createEl("p", {
+				text: "No projects configured yet. Run the setup wizard to add your first Supabase project.",
 			});
-
-		new Setting(containerEl)
-			.setName("One-click project setup")
-			.setDesc(
-				"Creates the table, enables realtime, and creates the sattachments storage bucket. Run once after creating your supabase project.",
-			)
-			.addButton((btn) => {
-				btn.setButtonText("Run full setup").setCta();
-				btn.onClick(async () => {
-					btn.setButtonText("Setting up… (step 1/3)").setDisabled(
-						true,
-					);
-					try {
-						await this.plugin.initializeSchema((step) => {
-							btn.setButtonText(`Setting up… (step ${step}/3)`);
-						});
-					} finally {
-						btn.setButtonText("Run full setup").setDisabled(false);
-					}
-				});
+			new Setting(containerEl)
+				.setName("Run setup wizard")
+				.setDesc("Walk through creating the table, bucket, and rls policy on one or more projects.")
+				.addButton((btn) =>
+					btn
+						.setButtonText("Open wizard")
+						.setCta()
+						.onClick(() => this.plugin.openSetupWizard("first-run")),
+				);
+		} else {
+			summary.createEl("p", {
+				text: `${enabledCount} of ${projectCount} project${projectCount > 1 ? "s" : ""} enabled · ~${usedMb} MB used / ~${totalQuotaMb} MB free-tier capacity`,
 			});
+		}
+	}
 
-		const guide = containerEl.createEl("details", {
-			cls: "sbj-setup-guide",
-		});
-		guide.createEl("summary", { text: "Manual setup guide (fallback)" });
-
-		const steps = guide.createEl("ol");
-		[
-			"Create a free project at supabase.com.",
-			"Copy the Project URL and anon/public API key from Project Settings → API.",
-			"Generate a Personal Access Token at supabase.com/dashboard/account/tokens.",
-			"Enter the URL, keys, and token above, then click Run full setup.",
-			"Alternatively, run the SQL below in the supabase SQL editor and create the storage bucket manually.",
-		].forEach((s) => steps.createEl("li", { text: s }));
-
-		guide.createEl("pre", { text: SETUP_SQL, cls: "sbj-sql-block" });
-
-		new Setting(containerEl).setName("Supabase credentials").setHeading();
-
-		new Setting(containerEl)
-			.setName("Project URL")
-			.setDesc("Your supabase project URL (https://<project-ref>.supabase.co)")
-			.addText((text) =>
-				text
-					.setPlaceholder("https://xxxx.supabase.co")
-					.setValue(this.plugin.settings.supabaseUrl)
-					.onChange(async (value) => {
-						this.plugin.settings.supabaseUrl = value.trim();
-						await this.plugin.saveSettings();
-					}),
-			);
-
-		new Setting(containerEl)
-			.setName("Anon/public key")
-			.setDesc("Found under project settings → API")
-			.addText((text) => {
-				text.setPlaceholder("••••••••")
-					.setValue(this.plugin.settings.supabaseAnonKey)
-					.onChange(async (value) => {
-						this.plugin.settings.supabaseAnonKey = value.trim();
-						await this.plugin.saveSettings();
-					});
-				text.inputEl.type = "password";
-			});
-
-		new Setting(containerEl).setName("Account").setHeading();
-
-		new Setting(containerEl)
-			.setName("Email")
-			.setDesc("Supabase auth email address")
-			.addText((text) =>
-				text
-					.setPlaceholder("You@example.com")
-					.setValue(this.plugin.settings.email)
-					.onChange(async (value) => {
-						this.plugin.settings.email = value.trim();
-						await this.plugin.saveSettings();
-					}),
-			);
-
-		new Setting(containerEl).setName("Password").addText((text) => {
-			text.setPlaceholder("••••••••")
-				.setValue(this.plugin.settings.password)
-				.onChange(async (value) => {
-					this.plugin.settings.password = value;
-					await this.plugin.saveSettings();
-				});
-			text.inputEl.type = "password";
-		});
-
-		new Setting(containerEl)
-			.setName("Connect")
-			.setDesc(
-				"Sign in (or create an account) using the credentials above",
-			)
-			.addButton((btn) =>
-				btn
-					.setButtonText("Connect")
-					.setCta()
-					.onClick(async () => {
-						btn.setButtonText("Connecting…").setDisabled(true);
-						try {
-							await this.plugin.initSupabase();
-						} finally {
-							btn.setButtonText("Connect").setDisabled(false);
-						}
-					}),
-			)
-			.addButton((btn) =>
-				btn.setButtonText("Sign out").onClick(async () => {
-					await this.plugin.signOut();
-				}),
-			);
-
+	private renderVault(containerEl: HTMLElement): void {
 		new Setting(containerEl).setName("Vault").setHeading();
 
 		let vaultIdText: TextComponent;
 		new Setting(containerEl)
 			.setName("Vault ID")
 			.setDesc(
-				"Unique identifier for this vault, files are namespaced under this ID in supabase storage, each vault syncing to the same supabase project needs a different ID",
+				"Identifier for this vault. Files from different vaults syncing to the same project must use different IDs.",
 			)
 			.addText((text) => {
 				vaultIdText = text;
@@ -320,12 +278,159 @@ export class SupaBaseJumpSettingTab extends PluginSettingTab {
 						new Notice("Supabase jump: vault ID generated");
 					}),
 			);
+	}
+
+	private renderProjects(containerEl: HTMLElement): void {
+		new Setting(containerEl).setName("Projects").setHeading();
+
+		for (const project of this.plugin.settings.projects) {
+			this.renderProjectCard(containerEl, project);
+		}
+
+		new Setting(containerEl)
+			.setName("Add a Supabase project")
+			.setDesc(
+				"Add another Supabase project to expand storage beyond a single free-tier quota. Files are sharded by path hash across enabled projects.",
+			)
+			.addButton((btn) =>
+				btn
+					.setButtonText("Add project")
+					.setCta()
+					.onClick(() => this.plugin.openSetupWizard("add-project")),
+			);
+
+		new Setting(containerEl)
+			.setName("Connect / sign in")
+			.setDesc("Sign in to every enabled project using stored credentials or magic-link otp.")
+			.addButton((btn) =>
+				btn
+					.setButtonText("Connect")
+					.setCta()
+					.onClick(async () => {
+						btn.setButtonText("Connecting…").setDisabled(true);
+						try {
+							await this.plugin.connectAll();
+						} finally {
+							btn.setButtonText("Connect").setDisabled(false);
+						}
+					}),
+			)
+			.addButton((btn) =>
+				btn.setButtonText("Sign out all").onClick(async () => {
+					await this.plugin.signOutAll();
+				}),
+			);
+
+		if (this.plugin.settings.projects.length > 1) {
+			new Setting(containerEl)
+				.setName("Rebalance shards")
+				.setDesc(
+					"Re-shard existing files across the current project set. Run after adding, removing, or disabling a project.",
+				)
+				.addButton((btn) =>
+					btn.setButtonText("Rebalance now").onClick(async () => {
+						btn.setButtonText("Rebalancing…").setDisabled(true);
+						try {
+							await this.plugin.rebalanceNow();
+						} finally {
+							btn.setButtonText("Rebalance now").setDisabled(false);
+						}
+					}),
+				);
+		}
+	}
+
+	private renderProjectCard(containerEl: HTMLElement, project: ProjectConfig): void {
+		const status = this.plugin.getProjectStatus(project.id);
+		const card = containerEl.createDiv({ cls: "sbj-project-card" });
+
+		const setting = new Setting(card)
+			.setName(project.label || "(unnamed project)")
+			.setDesc(
+				`${project.supabaseUrl || "no URL"} · auth: ${project.authMethod === "magic_link" ? "magic link" : "password"} · ${status.state}${status.detail ? " — " + status.detail : ""}`,
+			);
+
+		setting.addToggle((toggle) =>
+			toggle.setValue(project.enabled).onChange(async (value) => {
+				await this.plugin.toggleProject(project.id, value);
+				this.display();
+			}),
+		);
+
+		setting.addButton((btn) =>
+			btn
+				.setButtonText("Edit")
+				.onClick(() => this.plugin.openSetupWizard("edit-project", project.id)),
+		);
+
+		setting.addButton((btn) =>
+			btn.setButtonText("Remove").setWarning().onClick(async () => {
+				// eslint-disable-next-line no-alert -- Obsidian has no built-in confirm dialog; a custom Modal is overkill for a low-risk destructive op
+				const ok = window.confirm(
+					`Remove project "${project.label || project.id}"? Files on this project will become unreachable until you re-add it or rebalance.`,
+				);
+				if (!ok) return;
+				await this.plugin.removeProject(project.id);
+				this.display();
+			}),
+		);
+
+		if (project.lastUsedBytes > 0) {
+			const mb = (project.lastUsedBytes / 1024 / 1024).toFixed(1);
+			const pct = Math.min(100, Math.round((project.lastUsedBytes / (500 * 1024 * 1024)) * 100));
+			card.createEl("p", {
+				text: `${mb} MB used of ~500 MB free tier (${pct}%)`,
+				cls: "sbj-project-quota",
+			});
+		}
+	}
+
+	private renderSyncBehaviour(containerEl: HTMLElement): void {
+		new Setting(containerEl).setName("Sync behaviour").setHeading();
+
+		new Setting(containerEl)
+			.setName("Sync on startup")
+			.setDesc("Run a full sync when the app opens.")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.syncOnStartup)
+					.onChange(async (value) => {
+						this.plugin.settings.syncOnStartup = value;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Sync config folder")
+			.setDesc(
+				"Sync the obsidian config folder (themes, snippets, plugin settings). Disable to sync notes only.",
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.syncConfigFolder)
+					.onChange(async (value) => {
+						this.plugin.settings.syncConfigFolder = value;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Sync interval (minutes)")
+			.setDesc("Background sync cadence. Set to 0 to disable.")
+			.addSlider((slider) =>
+				slider
+					.setLimits(0, 60, 1)
+					.setValue(this.plugin.settings.syncIntervalMinutes)
+					.setDynamicTooltip()
+					.onChange(async (value) => {
+						this.plugin.settings.syncIntervalMinutes = value;
+						await this.plugin.saveSettings();
+					}),
+			);
 
 		new Setting(containerEl)
 			.setName("Excluded folders")
-			.setDesc(
-				"Comma-separated list of folder paths to exclude from sync (e.g. templates, archive/old)",
-			)
+			.setDesc("Comma-separated folder paths to skip (e.g. Templates, archive/old).")
 			.addText((text) =>
 				text
 					.setPlaceholder("Templates, archive/old")
@@ -338,17 +443,20 @@ export class SupaBaseJumpSettingTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 					}),
 			);
+	}
 
+	private renderPlatformPaths(containerEl: HTMLElement): void {
 		new Setting(containerEl)
 			.setName("Platform-specific config paths")
 			.setDesc(
-				"Config paths that sync only to the current platform (mobile or desktop). Toggle common paths below, or add custom ones.",
-			).setHeading();
+				"Paths that sync only to the current platform (mobile or desktop). Toggle common ones below; add custom paths in the bottom field.",
+			)
+			.setHeading();
 
 		const WELL_KNOWN_PATHS = [
 			{ path: "appearance.json", label: "Appearance (themes, fonts, colors)" },
 			{ path: "themes/", label: "Themes folder" },
-			{ path: "snippets/", label: "CSS Snippets folder" },
+			{ path: "snippets/", label: "CSS snippets folder" },
 			{ path: "plugins/", label: "All plugins folder" },
 			{ path: "community-plugins.json", label: "Installed plugins list" },
 			{ path: "hotkeys.json", label: "Custom hotkeys" },
@@ -379,9 +487,7 @@ export class SupaBaseJumpSettingTab extends PluginSettingTab {
 		);
 		new Setting(containerEl)
 			.setName("Custom paths")
-			.setDesc(
-				"Comma-separated additional paths not listed above",
-			)
+			.setDesc("Comma-separated additional paths.")
 			.addText((text) =>
 				text
 					.setPlaceholder("my-plugin/, custom.json")
@@ -394,65 +500,18 @@ export class SupaBaseJumpSettingTab extends PluginSettingTab {
 							.split(",")
 							.map((s) => s.trim())
 							.filter(Boolean);
-						this.plugin.settings.platformExcludedPaths = [
-							...knownActive,
-							...custom,
-						];
+						this.plugin.settings.platformExcludedPaths = [...knownActive, ...custom];
 						await this.plugin.saveSettings();
 					}),
 			);
+	}
 
-		new Setting(containerEl).setName("Sync behaviour").setHeading();
-
-		new Setting(containerEl)
-			.setName("Sync on startup")
-			.setDesc("Run a full sync automatically when the app opens")
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.syncOnStartup)
-					.onChange(async (value) => {
-						this.plugin.settings.syncOnStartup = value;
-						await this.plugin.saveSettings();
-					}),
-			);
-
-		new Setting(containerEl)
-			.setName("Sync config folder")
-			.setDesc(
-				"Watch and sync the config folder (themes, snippets, plugin settings, etc.). Disable if you only want to sync vault notes.",
-			)
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.syncConfigFolder)
-					.onChange(async (value) => {
-						this.plugin.settings.syncConfigFolder = value;
-						await this.plugin.saveSettings();
-					}),
-			);
-
-		new Setting(containerEl)
-			.setName("Sync interval (minutes)")
-			.setDesc(
-				"How often to sync in the background. Set to 0 to disable.",
-			)
-			.addSlider((slider) =>
-				slider
-					.setLimits(0, 60, 1)
-					.setValue(this.plugin.settings.syncIntervalMinutes)
-					.setDynamicTooltip()
-					.onChange(async (value) => {
-						this.plugin.settings.syncIntervalMinutes = value;
-						await this.plugin.saveSettings();
-					}),
-			);
-
+	private renderActions(containerEl: HTMLElement): void {
 		new Setting(containerEl).setName("Actions").setHeading();
 
 		new Setting(containerEl)
 			.setName("Force sync")
-			.setDesc(
-				"Immediately compare and reconcile all local and remote files",
-			)
+			.setDesc("Compare and reconcile every file across all enabled projects.")
 			.addButton((btn) =>
 				btn
 					.setButtonText("Sync now")
@@ -469,9 +528,7 @@ export class SupaBaseJumpSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Fetch from database")
-			.setDesc(
-				"Download all remote changes without pushing local files",
-			)
+			.setDesc("Pull-only sync: download remote changes without pushing local files.")
 			.addButton((btn) =>
 				btn.setButtonText("Fetch now").onClick(async () => {
 					btn.setButtonText("Fetching…").setDisabled(true);
@@ -484,13 +541,55 @@ export class SupaBaseJumpSettingTab extends PluginSettingTab {
 			);
 
 		if (this.plugin.settings.lastSyncTime > 0) {
-			const ts = new Date(
-				this.plugin.settings.lastSyncTime,
-			).toLocaleString();
-			containerEl.createEl("p", {
-				text: `Last synced: ${ts}`,
-				cls: "sbj-last-sync",
-			});
+			const ts = new Date(this.plugin.settings.lastSyncTime).toLocaleString();
+			containerEl.createEl("p", { text: `Last synced: ${ts}`, cls: "sbj-last-sync" });
 		}
+	}
+
+	private renderDiagnostics(containerEl: HTMLElement): void {
+		new Setting(containerEl).setName("Diagnostics").setHeading();
+
+		new Setting(containerEl)
+			.setName("Log level")
+			.setDesc("Higher levels capture more detail in the log panel. Debug is verbose; use it only when investigating an issue.")
+			.addDropdown((dd) =>
+				dd
+					.addOptions({ error: "error", warn: "warn", info: "info", debug: "debug" })
+					.setValue(this.plugin.settings.logging.level)
+					.onChange(async (value) => {
+						this.plugin.settings.logging.level = value as LogLevel;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Open log panel")
+			.setDesc("View the in-memory ring buffer with filtering.")
+			.addButton((btn) =>
+				btn.setButtonText("Open").onClick(() => this.plugin.openLogPanel()),
+			);
+
+		new Setting(containerEl)
+			.setName("Copy diagnostics")
+			.setDesc("Copy a redacted log bundle to the clipboard for issue reports.")
+			.addButton((btn) =>
+				btn.setButtonText("Copy").onClick(async () => {
+					await this.plugin.copyDiagnostics();
+				}),
+			);
+
+		new Setting(containerEl)
+			.setName("Realtime escalate-after (seconds)")
+			.setDesc("How long a realtime channel must stay down before showing a user notice. Keeps short hiccups silent.")
+			.addSlider((slider) =>
+				slider
+					.setLimits(5, 120, 5)
+					.setValue(Math.round(this.plugin.settings.realtime.escalateAfterMs / 1000))
+					.setDynamicTooltip()
+					.onChange(async (value) => {
+						this.plugin.settings.realtime.escalateAfterMs = value * 1000;
+						await this.plugin.saveSettings();
+					}),
+			);
 	}
 }
