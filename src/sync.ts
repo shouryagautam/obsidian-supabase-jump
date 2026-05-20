@@ -634,11 +634,28 @@ export class SyncEngine {
 	startRealtimeListeners(): void {
 		this.stopRealtimeListeners();
 		const { vaultId } = this.host.settings;
-		if (!vaultId) return;
+		if (!vaultId) {
+			logger.warn("realtime", "startRealtimeListeners: no vaultId, skipping");
+			return;
+		}
+		logger.info("realtime", "starting listeners", {
+			vaultId,
+			projects: enabledOrdered(this.host.settings.projects).map((p) => p.id),
+			isMobile: Platform.isMobile,
+		});
 
 		for (const project of enabledOrdered(this.host.settings.projects)) {
 			const rt = this.host.pool.getRuntime(project.id);
-			if (!rt) continue;
+			if (!rt) {
+				logger.warn("realtime", "no runtime for project, skipping", { projectId: project.id });
+				continue;
+			}
+			logger.info("realtime", "subscribing", {
+				projectId: project.id,
+				vaultId,
+				filter: `vault_id=eq.${vaultId}`,
+				channelName: `vault-${vaultId}-${project.id.slice(0, 8)}`,
+			});
 
 			const supervised = superviseChannel({
 				scope: `realtime:${project.id.slice(0, 6)}`,
@@ -685,6 +702,15 @@ export class SyncEngine {
 		projectId: string,
 	): Promise<void> {
 		const { eventType, new: newRow, old: oldRow } = payload;
+		logger.info("realtime", "event received", {
+			projectId,
+			eventType,
+			path: newRow?.path ?? oldRow?.path,
+			vault_id: newRow?.vault_id ?? oldRow?.vault_id,
+			row_mtime: newRow?.mtime,
+			platform: newRow?.platform,
+			deleted: newRow?.deleted,
+		});
 
 		if (eventType === "DELETE") {
 			const path = oldRow.path;
@@ -693,19 +719,38 @@ export class SyncEngine {
 		}
 
 		const row = newRow as VaultFileRow;
-		if (!row?.path) return;
+		if (!row?.path) {
+			logger.info("realtime", "skip: no path on row", { projectId });
+			return;
+		}
 
 		if (row.deleted) {
 			await this.deleteLocalFile(row.path);
 			return;
 		}
 
-		if (this.crdtIsActive?.(row.path)) return;
+		if (this.crdtIsActive?.(row.path)) {
+			logger.info("realtime", "skip: crdt active for path", { path: row.path });
+			return;
+		}
 
 		const localMtime = await this.getLocalMtime(row.path);
-		if (row.mtime > localMtime && this.shouldPull(row)) {
-			await this.pullFile(row, projectId);
+		const pullOk = this.shouldPull(row);
+		const mtimeOk = row.mtime > localMtime;
+		if (!mtimeOk || !pullOk) {
+			logger.info("realtime", "skip: not applying", {
+				path: row.path,
+				row_mtime: row.mtime,
+				local_mtime: localMtime,
+				mtimeOk,
+				pullOk,
+				platform: row.platform,
+				isMobile: Platform.isMobile,
+			});
+			return;
 		}
+		logger.info("realtime", "applying pull", { path: row.path, projectId });
+		await this.pullFile(row, projectId);
 	}
 
 	private async deleteLocalFile(path: string): Promise<void> {
