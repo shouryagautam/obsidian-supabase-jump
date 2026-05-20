@@ -195,6 +195,7 @@ export interface SettingsTabHost {
 	fullSync(): Promise<void>;
 	fetchNow(): Promise<void>;
 	openSetupWizard(mode: "first-run" | "add-project" | "edit-project", projectId?: string): void;
+	cleanup(): void;
 	openLogPanel(): void;
 	copyDiagnostics(): Promise<void>;
 	rebalanceNow(): Promise<void>;
@@ -219,10 +220,156 @@ export class SupaBaseJumpSettingTab extends PluginSettingTab {
 		this.renderHeader(containerEl);
 		this.renderVault(containerEl);
 		this.renderProjects(containerEl);
+		this.renderTransferAll(containerEl);
 		this.renderSyncBehaviour(containerEl);
 		this.renderPlatformPaths(containerEl);
 		this.renderActions(containerEl);
 		this.renderDiagnostics(containerEl);
+	}
+
+	private renderTransferAll(containerEl: HTMLElement): void {
+		new Setting(containerEl).setName("Transfer all projects").setHeading();
+
+		containerEl.createEl("p", {
+			text: "Full setup string covers EVERY project plus the routing salt and vault ID, so a new device gets identical sharding (same path → same project on every device). Per-project export in the wizard works for single-project transfers; use this when you have two or more projects. Treat the blob as a credential.",
+			cls: "sbj-help",
+		});
+
+		new Setting(containerEl)
+			.setName("Export full setup")
+			.setDesc("Copies all projects + vault ID + hashSalt to your clipboard.")
+			.addButton((btn) =>
+				btn.setButtonText("Copy full export").onClick(async () => {
+					const blob = this.buildFullExportBlob();
+					if (!blob) {
+						new Notice("Supabase jump: no projects to export.");
+						return;
+					}
+					try {
+						await navigator.clipboard.writeText(blob);
+						new Notice("Supabase jump: full setup copied to clipboard.");
+					} catch (err) {
+						new Notice(
+							`Supabase jump: clipboard write failed — ${err instanceof Error ? err.message : String(err)}`,
+						);
+					}
+				}),
+			);
+
+		let importValue = "";
+		new Setting(containerEl)
+			.setName("Import full setup")
+			.setDesc("REPLACES every project and the routing config. Paste a full export string, then click Apply.")
+			.addText((t) =>
+				t.setPlaceholder("eyJ2IjozLC…").onChange((v) => {
+					importValue = v.trim();
+				}),
+			)
+			.addButton((btn) =>
+				btn.setButtonText("Apply (replaces all)").setWarning().onClick(async () => {
+					const ok = await this.applyFullImportBlob(importValue);
+					if (!ok) return;
+					new Notice("Supabase jump: full setup imported — reconnecting…");
+					await this.plugin.connectAll();
+					this.display();
+				}),
+			);
+	}
+
+	private buildFullExportBlob(): string | null {
+		const s = this.plugin.settings;
+		if (s.projects.length === 0) return null;
+		const payload = {
+			v: 3,
+			kind: "full",
+			vaultId: s.vaultId,
+			hashSalt: s.routing.hashSalt,
+			projects: s.projects.map((p) => ({
+				id: p.id,
+				label: p.label,
+				supabaseUrl: p.supabaseUrl,
+				supabaseAnonKey: p.supabaseAnonKey,
+				authMethod: p.authMethod,
+				email: p.email,
+				passwordEncrypted: p.passwordEncrypted,
+				enabled: p.enabled,
+			})),
+		};
+		try {
+			return btoa(JSON.stringify(payload));
+		} catch {
+			return null;
+		}
+	}
+
+	private async applyFullImportBlob(raw: string): Promise<boolean> {
+		if (!raw) {
+			new Notice("Supabase jump: import string is empty.");
+			return false;
+		}
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(atob(raw));
+		} catch {
+			new Notice("Supabase jump: could not decode import string.");
+			return false;
+		}
+		if (typeof parsed !== "object" || parsed === null) {
+			new Notice("Supabase jump: import payload is invalid.");
+			return false;
+		}
+		const p = parsed as Record<string, unknown>;
+		if (p.v !== 3 || p.kind !== "full") {
+			new Notice("Supabase jump: not a full setup export — use per-project import for v1/v2 blobs.");
+			return false;
+		}
+		if (
+			typeof p.vaultId !== "string" ||
+			typeof p.hashSalt !== "string" ||
+			!Array.isArray(p.projects)
+		) {
+			new Notice("Supabase jump: required fields missing in import.");
+			return false;
+		}
+
+		const normalized: ProjectConfig[] = [];
+		for (const rawProj of p.projects) {
+			if (typeof rawProj !== "object" || rawProj === null) continue;
+			const r = rawProj as Record<string, unknown>;
+			if (
+				typeof r.id !== "string" ||
+				typeof r.supabaseUrl !== "string" ||
+				typeof r.supabaseAnonKey !== "string" ||
+				typeof r.email !== "string"
+			) {
+				continue;
+			}
+			normalized.push({
+				id: r.id,
+				label: typeof r.label === "string" ? r.label : "Project",
+				supabaseUrl: r.supabaseUrl,
+				supabaseAnonKey: r.supabaseAnonKey,
+				authMethod: r.authMethod === "magic_link" ? "magic_link" : "password",
+				email: r.email,
+				passwordEncrypted: typeof r.passwordEncrypted === "string" ? r.passwordEncrypted : "",
+				enabled: r.enabled !== false,
+				lastUsedBytes: 0,
+				lastConnectedAt: 0,
+			});
+		}
+
+		// Tear down live connections before swapping the underlying config so we
+		// don't leave subscriptions pointing at projects that are about to vanish.
+		this.plugin.cleanup();
+		this.plugin.settings.vaultId = p.vaultId;
+		this.plugin.settings.routing.hashSalt = p.hashSalt;
+		this.plugin.settings.projects = normalized;
+		await this.plugin.saveSettings();
+		logger.info("settings", "full setup imported", {
+			projectCount: normalized.length,
+			vaultId: p.vaultId,
+		});
+		return true;
 	}
 
 	private renderHeader(containerEl: HTMLElement): void {
