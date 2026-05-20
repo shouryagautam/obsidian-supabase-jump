@@ -249,13 +249,13 @@ export class SetupWizardModal extends Modal {
 		new Setting(root).setName("Transfer setup").setHeading();
 
 		root.createEl("p", {
-			text: "Copy one string to set up the same project on another device. Password and PAT are never included — you'll enter those fresh.",
+			text: "Copy one string to set up the same project on another device. The password is included (lightly obfuscated, like the rest of the plugin's storage) — treat the blob as a credential and do not share it.",
 			cls: "sbj-help",
 		});
 
 		new Setting(root)
 			.setName("Export this project")
-			.setDesc("Copies URL + anon key + email + vault ID + label to your clipboard.")
+			.setDesc("Copies URL + anon key + email + vault ID + label + password to your clipboard.")
 			.addButton((btn) =>
 				btn.setButtonText("Copy export string").onClick(async () => {
 					const blob = this.buildExportBlob();
@@ -300,14 +300,19 @@ export class SetupWizardModal extends Modal {
 	private buildExportBlob(): string | null {
 		const d = this.state.draft;
 		if (!d.supabaseUrl || !d.supabaseAnonKey || !d.email) return null;
+		const passwordEncrypted =
+			d.authMethod === "password" && this.password
+				? encryptSecret(this.password, this.host.settings.vaultId)
+				: d.passwordEncrypted;
 		const payload = {
-			v: 1,
+			v: 2,
 			label: d.label,
 			supabaseUrl: d.supabaseUrl,
 			supabaseAnonKey: d.supabaseAnonKey,
 			authMethod: d.authMethod,
 			email: d.email,
 			vaultId: this.host.settings.vaultId,
+			passwordEncrypted,
 		};
 		try {
 			return btoa(JSON.stringify(payload));
@@ -333,7 +338,7 @@ export class SetupWizardModal extends Modal {
 			return false;
 		}
 		const p = parsed as Record<string, unknown>;
-		if (p.v !== 1) {
+		if (p.v !== 1 && p.v !== 2) {
 			new Notice("Supabase jump: unsupported import version.");
 			return false;
 		}
@@ -354,6 +359,9 @@ export class SetupWizardModal extends Modal {
 		}
 		if (typeof p.vaultId === "string" && p.vaultId) {
 			this.host.settings.vaultId = p.vaultId;
+		}
+		if (typeof p.passwordEncrypted === "string") {
+			this.state.draft.passwordEncrypted = p.passwordEncrypted;
 		}
 		return true;
 	}
