@@ -178,7 +178,11 @@ export default class SupaBaseJumpPlugin extends Plugin implements SettingsTabHos
 				saveSettings: () => this.saveSettings(),
 				connectProject: async (id) => {
 					const project = this.settings.projects.find((p) => p.id === id);
-					if (project) await this.pool.connect(project);
+					if (!project) return;
+					this.pool.syncFromSettings();
+					await this.pool.connect(project);
+					this.syncEngine.startRealtimeListeners();
+					this.refreshStatusBar();
 				},
 				refreshSettingsUi: () => this.refreshSettingsTab(),
 			},

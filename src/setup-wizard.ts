@@ -653,6 +653,7 @@ export class SetupWizardModal extends Modal {
 						btn.setDisabled(true);
 						try {
 							await this.persistDraft();
+							await this.host.connectProject(this.state.draft.id);
 							new Notice(`Supabase jump: project "${this.state.draft.label}" saved`);
 							this.host.refreshSettingsUi();
 							this.close();
