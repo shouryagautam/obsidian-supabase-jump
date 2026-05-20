@@ -51,8 +51,14 @@ export default class SupaBaseJumpPlugin extends Plugin implements SettingsTabHos
 
 	async onload() {
 		await this.loadSettings();
-		logger.configure(this.settings.logging.level, this.settings.logging.bufferSize);
+		logger.configure(
+			this.settings.logging.level,
+			this.settings.logging.bufferSize,
+			this.settings.logging.enabled,
+			this.settings.logging.maxAgeMinutes * 60_000,
+		);
 		logger.info("plugin", "load", { version: this.manifest.version });
+		this.registerInterval(window.setInterval(() => logger.purgeExpired(), 60_000));
 
 		this.statusBarItem = this.addStatusBarItem();
 		this.pool = new ProjectClientPool(this.settings);
@@ -99,7 +105,12 @@ export default class SupaBaseJumpPlugin extends Plugin implements SettingsTabHos
 
 	async saveSettings() {
 		await this.saveData(this.settings);
-		logger.configure(this.settings.logging.level, this.settings.logging.bufferSize);
+		logger.configure(
+			this.settings.logging.level,
+			this.settings.logging.bufferSize,
+			this.settings.logging.enabled,
+			this.settings.logging.maxAgeMinutes * 60_000,
+		);
 		this.crdtManager?.configure(this.pool, this.settings.vaultId, this.settings.realtime);
 	}
 

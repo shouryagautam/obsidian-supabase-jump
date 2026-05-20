@@ -6,7 +6,7 @@ import {
 	Setting,
 	TextComponent,
 } from "obsidian";
-import type { LogLevel } from "./logger";
+import { logger, type LogLevel } from "./logger";
 
 export const SETTINGS_SCHEMA_VERSION = 2;
 
@@ -36,6 +36,9 @@ export interface RoutingConfig {
 export interface LoggingConfig {
 	level: LogLevel;
 	bufferSize: number;
+	enabled: boolean;
+	// Auto-purge entries older than this many minutes. 0 disables time-based purge.
+	maxAgeMinutes: number;
 }
 
 export interface RealtimeTuning {
@@ -66,7 +69,7 @@ export const DEFAULT_SETTINGS: SupaBaseJumpSettings = {
 	vaultId: "",
 	projects: [],
 	routing: { strategy: "hash_mod", hashSalt: "" },
-	logging: { level: "info", bufferSize: 1000 },
+	logging: { level: "info", bufferSize: 1000, enabled: true, maxAgeMinutes: 60 },
 	realtime: {
 		reconnectInitialMs: 1000,
 		reconnectMaxMs: 60000,
@@ -550,6 +553,16 @@ export class SupaBaseJumpSettingTab extends PluginSettingTab {
 		new Setting(containerEl).setName("Diagnostics").setHeading();
 
 		new Setting(containerEl)
+			.setName("Enable logging")
+			.setDesc("When off, the in-memory ring buffer is bypassed; only error/warn still go to the browser console.")
+			.addToggle((tg) =>
+				tg.setValue(this.plugin.settings.logging.enabled).onChange(async (value) => {
+					this.plugin.settings.logging.enabled = value;
+					await this.plugin.saveSettings();
+				}),
+			);
+
+		new Setting(containerEl)
 			.setName("Log level")
 			.setDesc("Higher levels capture more detail in the log panel. Debug is verbose; use it only when investigating an issue.")
 			.addDropdown((dd) =>
@@ -560,6 +573,43 @@ export class SupaBaseJumpSettingTab extends PluginSettingTab {
 						this.plugin.settings.logging.level = value as LogLevel;
 						await this.plugin.saveSettings();
 					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Log buffer size")
+			.setDesc("Maximum entries kept in memory. Oldest are dropped when full. Range: 50–10000.")
+			.addText((t) => {
+				t.setValue(String(this.plugin.settings.logging.bufferSize)).onChange(async (value) => {
+					const n = Number.parseInt(value, 10);
+					if (!Number.isFinite(n)) return;
+					this.plugin.settings.logging.bufferSize = Math.max(50, Math.min(10000, n));
+					await this.plugin.saveSettings();
+				});
+				t.inputEl.type = "number";
+			});
+
+		new Setting(containerEl)
+			.setName("Auto-purge older than (minutes)")
+			.setDesc("Entries older than this are dropped every minute. Set to 0 to keep entries until the buffer fills.")
+			.addText((t) => {
+				t.setValue(String(this.plugin.settings.logging.maxAgeMinutes)).onChange(async (value) => {
+					const n = Number.parseInt(value, 10);
+					if (!Number.isFinite(n) || n < 0) return;
+					this.plugin.settings.logging.maxAgeMinutes = n;
+					await this.plugin.saveSettings();
+					logger.purgeExpired();
+				});
+				t.inputEl.type = "number";
+			});
+
+		new Setting(containerEl)
+			.setName("Clear logs now")
+			.setDesc("Empties the in-memory buffer immediately.")
+			.addButton((btn) =>
+				btn.setButtonText("Clear").onClick(() => {
+					logger.clear();
+					new Notice("Supabase jump: log buffer cleared");
+				}),
 			);
 
 		new Setting(containerEl)

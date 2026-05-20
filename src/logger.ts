@@ -82,13 +82,33 @@ export class Logger {
 	private listeners: Set<LogListener> = new Set();
 	private level: LogLevel = "info";
 	private size = 1000;
+	private enabled = true;
+	private maxAgeMs = 0;
 
-	configure(level: LogLevel, bufferSize: number): void {
+	configure(level: LogLevel, bufferSize: number, enabled = true, maxAgeMs = 0): void {
 		this.level = level;
 		this.size = Math.max(50, Math.min(10000, bufferSize));
+		this.enabled = enabled;
+		this.maxAgeMs = Math.max(0, maxAgeMs);
 		if (this.buffer.length > this.size) {
 			this.buffer.splice(0, this.buffer.length - this.size);
 		}
+		this.purgeExpired();
+	}
+
+	// Drop entries older than maxAgeMs (FIFO; buffer is append-only so timestamps are sorted).
+	// Returns how many entries were dropped. No-op when maxAgeMs is 0.
+	purgeExpired(): number {
+		if (this.maxAgeMs <= 0 || this.buffer.length === 0) return 0;
+		const cutoff = Date.now() - this.maxAgeMs;
+		let dropIdx = 0;
+		while (dropIdx < this.buffer.length) {
+			const entry = this.buffer[dropIdx];
+			if (!entry || entry.ts >= cutoff) break;
+			dropIdx++;
+		}
+		if (dropIdx > 0) this.buffer.splice(0, dropIdx);
+		return dropIdx;
 	}
 
 	addListener(fn: LogListener): () => void {
@@ -144,6 +164,16 @@ export class Logger {
 	}
 
 	private emit(level: LogLevel, scope: string, msg: string, data?: unknown): void {
+		// Errors and warnings still hit the console even when buffer logging is off,
+		// so production issues remain visible in devtools without polluting the buffer.
+		if (!this.enabled) {
+			if (level === "error") {
+				console.error(`[supabase-jump:${scope}] ${msg}`, data ?? "");
+			} else if (level === "warn") {
+				console.warn(`[supabase-jump:${scope}] ${msg}`, data ?? "");
+			}
+			return;
+		}
 		if (LEVEL_ORDER[level] > LEVEL_ORDER[this.level]) return;
 		const entry: LogEntry = { ts: Date.now(), level, scope, msg, data };
 		this.buffer.push(entry);
