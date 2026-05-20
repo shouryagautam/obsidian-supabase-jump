@@ -21,6 +21,7 @@ export class RealtimeCrdtManager {
 	private activeChannel: RealtimeChannel | null = null;
 	private supervised: SupervisedChannel | null = null;
 	private activeProjectId: string | null = null;
+	private enabled = false;
 
 	private ydoc: Y.Doc | null = null;
 	private ytext: Y.Text | null = null;
@@ -32,10 +33,15 @@ export class RealtimeCrdtManager {
 		this.plugin = plugin;
 	}
 
-	configure(pool: ProjectClientPool | null, vaultId: string, tuning: RealtimeTuning) {
+	configure(pool: ProjectClientPool | null, vaultId: string, tuning: RealtimeTuning, enabled = false) {
 		this.pool = pool;
 		this.vaultId = vaultId;
 		this.tuning = tuning;
+		if (this.enabled && !enabled) {
+			// Was on, now off — drop any live session.
+			this.leaveCurrentChannel();
+		}
+		this.enabled = enabled;
 	}
 
 	isActiveFile(path: string): boolean {
@@ -67,6 +73,7 @@ export class RealtimeCrdtManager {
 	private async handleLeafChange(leaf: WorkspaceLeaf | null) {
 		this.leaveCurrentChannel();
 
+		if (!this.enabled) return;
 		if (!leaf || !this.pool || !this.vaultId || !this.tuning) return;
 
 		const view = leaf.view;

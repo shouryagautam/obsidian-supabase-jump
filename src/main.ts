@@ -74,7 +74,12 @@ export default class SupaBaseJumpPlugin extends Plugin implements SettingsTabHos
 		});
 
 		this.crdtManager = new RealtimeCrdtManager(this);
-		this.crdtManager.configure(this.pool, this.settings.vaultId, this.settings.realtime);
+		this.crdtManager.configure(
+			this.pool,
+			this.settings.vaultId,
+			this.settings.realtime,
+			this.settings.coEditEnabled,
+		);
 
 		this.addSettingTab(new SupaBaseJumpSettingTab(this.app, this));
 		this.registerVaultEvents();
@@ -111,7 +116,12 @@ export default class SupaBaseJumpPlugin extends Plugin implements SettingsTabHos
 			this.settings.logging.enabled,
 			this.settings.logging.maxAgeMinutes * 60_000,
 		);
-		this.crdtManager?.configure(this.pool, this.settings.vaultId, this.settings.realtime);
+		this.crdtManager?.configure(
+			this.pool,
+			this.settings.vaultId,
+			this.settings.realtime,
+			this.settings.coEditEnabled,
+		);
 	}
 
 	setStatus(status: SyncStatus): void {

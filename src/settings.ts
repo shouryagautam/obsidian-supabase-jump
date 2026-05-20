@@ -60,6 +60,12 @@ export interface SupaBaseJumpSettings {
 	excludedFolders: string[];
 	platformExcludedPaths: string[];
 	lastSyncTime: number;
+	// Experimental sub-second co-edit via Yjs broadcast channels. Disabled by
+	// default because the current init flow (both peers seed Y.Text with disk
+	// content independently) produces duplicated content when the same note is
+	// open on two devices. Standard cross-device sync via postgres_changes works
+	// regardless of this flag.
+	coEditEnabled: boolean;
 	// Resumable rebalance progress; absent when no rebalance is queued.
 	rebalanceProgress?: { startedAt: number; movedRowIds: string[] };
 }
@@ -81,6 +87,7 @@ export const DEFAULT_SETTINGS: SupaBaseJumpSettings = {
 	excludedFolders: [],
 	platformExcludedPaths: [],
 	lastSyncTime: 0,
+	coEditEnabled: false,
 };
 
 const OS_SYSTEM_FILES = new Set([
@@ -625,6 +632,16 @@ export class SupaBaseJumpSettingTab extends PluginSettingTab {
 			.addButton((btn) =>
 				btn.setButtonText("Copy").onClick(async () => {
 					await this.plugin.copyDiagnostics();
+				}),
+			);
+
+		new Setting(containerEl)
+			.setName("Sub-second co-edit (experimental)")
+			.setDesc("Adds character-by-character live editing over a Yjs broadcast channel when the same note is open on multiple devices. KNOWN ISSUE: the current init flow can duplicate content when both peers open the note independently. Standard cross-device sync still works with this off.")
+			.addToggle((tg) =>
+				tg.setValue(this.plugin.settings.coEditEnabled).onChange(async (value) => {
+					this.plugin.settings.coEditEnabled = value;
+					await this.plugin.saveSettings();
 				}),
 			);
 

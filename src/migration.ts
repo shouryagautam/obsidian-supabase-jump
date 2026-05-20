@@ -121,6 +121,7 @@ function migrateV1ToV2(v1: LegacyV1Settings): SupaBaseJumpSettings {
 		excludedFolders: v1.excludedFolders ?? [],
 		platformExcludedPaths: v1.platformExcludedPaths ?? [],
 		lastSyncTime: v1.lastSyncTime ?? 0,
+		coEditEnabled: false,
 	};
 
 	logger.info("migration", "Migrated v1 settings to v2", {
