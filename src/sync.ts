@@ -434,26 +434,56 @@ export class SyncEngine {
 		}
 	}
 
-	private async collectRemoteRows(): Promise<Map<string, RemoteLocation>> {
+	// Run an async task across a list of items with a bounded number of in-flight
+	// promises. Errors inside `task` are the caller's responsibility — this helper
+	// never throws (it's intentionally fire-and-collect-results).
+	private async runWithConcurrency<T>(
+		items: readonly T[],
+		concurrency: number,
+		task: (item: T) => Promise<void>,
+	): Promise<void> {
+		if (items.length === 0) return;
+		const width = Math.max(1, Math.min(concurrency, items.length));
+		let cursor = 0;
+		const workers: Promise<void>[] = [];
+		for (let w = 0; w < width; w++) {
+			workers.push(
+				(async () => {
+					while (cursor < items.length) {
+						const i = cursor++;
+						const item = items[i];
+						if (item === undefined) continue;
+						await task(item);
+					}
+				})(),
+			);
+		}
+		await Promise.all(workers);
+	}
+
+	private async collectRemoteRows(sinceMs = 0): Promise<Map<string, RemoteLocation>> {
 		const { vaultId } = this.host.settings;
 		const remoteMap = new Map<string, RemoteLocation>();
+		// 10-second safety buffer accommodates clock skew and rows whose updated_at
+		// is set on the server slightly after our local timestamp at sync start.
+		const sinceIso = sinceMs > 0 ? new Date(sinceMs - 10_000).toISOString() : null;
 
 		for (const rt of this.host.pool.forAllEnabled()) {
-			try {
-				const { data, error } = await rt.client
+			const runQuery = () => {
+				const q = rt.client
 					.from(DB_TABLE)
 					.select("*")
 					.eq("vault_id", vaultId)
 					.eq("deleted", false);
+				return sinceIso ? q.gt("updated_at", sinceIso) : q;
+			};
+			try {
+				const { data, error } = await runQuery();
 				if (error) {
 					if (isJwtExpired(error)) {
 						const ok = await this.host.pool.refreshSession(rt.id);
 						if (ok) {
-							const retry = await rt.client
-								.from(DB_TABLE)
-								.select("*")
-								.eq("vault_id", vaultId)
-								.eq("deleted", false);
+							const retry = await runQuery();
 							if (!retry.error && retry.data) {
 								for (const row of retry.data as VaultFileRow[]) {
 									this.acceptRemoteRow(remoteMap, row, rt.id);
@@ -515,25 +545,37 @@ export class SyncEngine {
 
 		this.host.setStatus("syncing");
 		const errors: string[] = [];
+		// Capture the cursor BEFORE issuing the query so that any rows updated
+		// while the sync is in flight are picked up by the next sync.
+		const cursorAtStart = Date.now();
+		const sinceMs = this.host.settings.lastSyncTime;
 
 		try {
-			const remoteMap = await this.collectRemoteRows();
+			const remoteMap = await this.collectRemoteRows(sinceMs);
+			logger.info("sync", "fetchOnly: collected remote delta", {
+				count: remoteMap.size,
+				sinceMs,
+				incremental: sinceMs > 0,
+			});
 
+			const pullCandidates: RemoteLocation[] = [];
 			for (const [, loc] of remoteMap) {
 				if (this.shouldSkip(loc.row.path)) continue;
 				if (!this.shouldPull(loc.row)) continue;
 				if (this.crdtIsActive?.(loc.row.path)) continue;
-				const localMtime = await this.getLocalMtime(loc.row.path);
-				if (loc.row.mtime > localMtime) {
-					try {
-						await this.pullFile(loc.row, loc.projectId);
-					} catch {
-						errors.push(loc.row.path);
-					}
-				}
+				pullCandidates.push(loc);
 			}
+			await this.runWithConcurrency(pullCandidates, 6, async (loc) => {
+				const localMtime = await this.getLocalMtime(loc.row.path);
+				if (loc.row.mtime <= localMtime) return;
+				try {
+					await this.pullFile(loc.row, loc.projectId);
+				} catch {
+					errors.push(loc.row.path);
+				}
+			});
 
-			this.host.settings.lastSyncTime = Date.now();
+			this.host.settings.lastSyncTime = cursorAtStart;
 			await this.host.saveSettings();
 			this.host.setStatus("synced");
 
@@ -567,16 +609,17 @@ export class SyncEngine {
 			const remoteMap = await this.collectRemoteRows();
 
 			const localFiles = this.host.vault.getFiles().filter((f) => !this.shouldSkip(f.path));
-			for (const file of localFiles) {
+			const filesNeedingPush = localFiles.filter((file) => {
 				const remote = remoteMap.get(file.path);
-				if (!remote || file.stat.mtime > remote.row.mtime) {
-					try {
-						await this.pushFile(file);
-					} catch {
-						errors.push(file.path);
-					}
+				return !remote || file.stat.mtime > remote.row.mtime;
+			});
+			await this.runWithConcurrency(filesNeedingPush, 6, async (file) => {
+				try {
+					await this.pushFile(file);
+				} catch {
+					errors.push(file.path);
 				}
-			}
+			});
 
 			const configPaths = await this.listAdapterFiles(this.host.vault.configDir);
 			if (configPaths.length > 0) {
@@ -601,19 +644,22 @@ export class SyncEngine {
 				}
 			}
 
+			const pullCandidates: RemoteLocation[] = [];
 			for (const [, loc] of remoteMap) {
 				if (this.shouldSkip(loc.row.path)) continue;
 				if (!this.shouldPull(loc.row)) continue;
 				if (this.crdtIsActive?.(loc.row.path)) continue;
-				const localMtime = await this.getLocalMtime(loc.row.path);
-				if (loc.row.mtime > localMtime) {
-					try {
-						await this.pullFile(loc.row, loc.projectId);
-					} catch {
-						errors.push(loc.row.path);
-					}
-				}
+				pullCandidates.push(loc);
 			}
+			await this.runWithConcurrency(pullCandidates, 6, async (loc) => {
+				const localMtime = await this.getLocalMtime(loc.row.path);
+				if (loc.row.mtime <= localMtime) return;
+				try {
+					await this.pullFile(loc.row, loc.projectId);
+				} catch {
+					errors.push(loc.row.path);
+				}
+			});
 
 			this.host.settings.lastSyncTime = Date.now();
 			await this.host.saveSettings();
