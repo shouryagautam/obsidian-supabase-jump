@@ -360,7 +360,7 @@ export class SetupWizardModal extends Modal {
 
 		new Setting(root)
 			.setName("Create vault-attachments bucket")
-			.setDesc("Private bucket for binary file uploads.")
+			.setDesc("Private bucket for binary file uploads. Created via SQL through the management query endpoint.")
 			.addButton((btn) =>
 				btn.setButtonText("Create / verify").onClick(async () => {
 					btn.setDisabled(true);
@@ -392,7 +392,7 @@ export class SetupWizardModal extends Modal {
 				pre.setText(this.state.bucketBody.slice(0, 1500));
 			}
 			container.createEl("p", {
-				text: "If automatic creation keeps failing, create the bucket manually in Supabase → storage (name: vault-attachments, public: off). Then click 'create / verify' to confirm.",
+				text: "If auto-create keeps failing, create the bucket manually in Supabase → Storage (name: vault-attachments, public: OFF), then click Create / verify to confirm.",
 				cls: "sbj-help",
 			});
 		}
@@ -445,6 +445,7 @@ export class SetupWizardModal extends Modal {
 							this.state.pendingOtp = !!res.pendingOtp;
 							if (res.pendingOtp) {
 								new Notice(`Supabase jump: OTP sent to ${this.state.draft.email}`);
+								this.render();
 							} else if (res.state === "error") {
 								new Notice(`Supabase jump: OTP request failed — ${res.detail}`);
 							}
@@ -630,31 +631,83 @@ export class SetupWizardModal extends Modal {
 			return;
 		}
 
-		const endpoint = `https://api.supabase.com/v1/projects/${ref}/storage/buckets`;
-		this.state.bucketEndpoint = endpoint;
-		try {
+		const listEndpoint = `https://api.supabase.com/v1/projects/${ref}/storage/buckets`;
+		const queryEndpoint = `https://api.supabase.com/v1/projects/${ref}/database/query`;
+		this.state.bucketEndpoint = listEndpoint;
+
+		const listBuckets = async (): Promise<{ ok: boolean; found: boolean; status: number; body: string; detail?: string }> => {
 			const res = await requestUrl({
-				url: endpoint,
+				url: listEndpoint,
+				method: "GET",
+				headers: { Authorization: `Bearer ${this.state.pat}` },
+				throw: false,
+			});
+			if (res.status < 200 || res.status >= 300) {
+				return { ok: false, found: false, status: res.status, body: res.text, detail: `HTTP ${res.status} — could not list buckets` };
+			}
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(res.text);
+			} catch {
+				return { ok: false, found: false, status: res.status, body: res.text, detail: "could not parse buckets response" };
+			}
+			const found =
+				Array.isArray(parsed) &&
+				parsed.some((b: unknown) => {
+					if (typeof b !== "object" || b === null) return false;
+					const rec = b as { name?: unknown; id?: unknown };
+					return rec.name === "vault-attachments" || rec.id === "vault-attachments";
+				});
+			return { ok: true, found, status: res.status, body: res.text };
+		};
+
+		try {
+			const first = await listBuckets();
+			this.state.bucketStatus = first.status;
+			this.state.bucketBody = first.body;
+			if (!first.ok) {
+				this.state.bucketOk = false;
+				this.state.bucketDetail = first.detail ?? `HTTP ${first.status}`;
+				logger.warn("setup", `bucket list failed`, { ref, status: first.status });
+				return;
+			}
+			if (first.found) {
+				this.state.bucketOk = true;
+				this.state.bucketDetail = "bucket already exists";
+				return;
+			}
+
+			this.state.bucketEndpoint = queryEndpoint;
+			const createSql = `INSERT INTO storage.buckets (id, name, public) VALUES ('vault-attachments', 'vault-attachments', false) ON CONFLICT (id) DO NOTHING;`;
+			const createRes = await requestUrl({
+				url: queryEndpoint,
 				method: "POST",
 				headers: {
 					Authorization: `Bearer ${this.state.pat}`,
 					"Content-Type": "application/json",
 				},
-				body: JSON.stringify({ id: "vault-attachments", name: "vault-attachments", public: false }),
+				body: JSON.stringify({ query: createSql }),
 				throw: false,
 			});
-			this.state.bucketStatus = res.status;
-			this.state.bucketBody = res.text;
-			if (res.status === 409) {
-				this.state.bucketOk = true;
-				this.state.bucketDetail = "bucket already exists";
-			} else if (res.status >= 200 && res.status < 300) {
+			this.state.bucketStatus = createRes.status;
+			this.state.bucketBody = createRes.text;
+			if (createRes.status < 200 || createRes.status >= 300) {
+				this.state.bucketOk = false;
+				this.state.bucketDetail = `HTTP ${createRes.status} — could not create bucket via SQL`;
+				logger.warn("setup", `bucket create (SQL) failed`, { ref, status: createRes.status });
+				return;
+			}
+
+			this.state.bucketEndpoint = listEndpoint;
+			const second = await listBuckets();
+			this.state.bucketStatus = second.status;
+			this.state.bucketBody = second.body;
+			if (second.ok && second.found) {
 				this.state.bucketOk = true;
 				this.state.bucketDetail = "bucket created";
 			} else {
 				this.state.bucketOk = false;
-				this.state.bucketDetail = `HTTP ${res.status}`;
-				logger.warn("setup", `bucket create failed`, { ref, status: res.status });
+				this.state.bucketDetail = "bucket insert reported success but bucket not visible — check Supabase → Storage";
 			}
 		} catch (err) {
 			this.state.bucketOk = false;
