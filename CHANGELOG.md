@@ -5,6 +5,39 @@ All notable changes to SupaBase Jump will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-05-20
+
+### Added
+
+- **Multi-project sharding.** Add one or more Supabase projects in settings; files are deterministically routed to a project by a stable FNV-1a hash of the path. Capacity scales linearly with the number of free-tier projects you add. New `src/routing.ts` + `src/project-client-pool.ts`.
+- **Setup wizard modal** (`src/setup-wizard.ts`). Walks through Project URL + anon key, runs the schema setup as seven labelled SQL fragments via the Supabase Management API, creates the storage bucket, signs you in, and verifies the project with a read + write round-trip. Each step reports HTTP status + response body on failure with a per-step retry button.
+- **Magic-link OTP auth.** Per-project choice between email/password and magic-link OTP. Magic-link sends a 6-digit code; no password stored.
+- **Adaptive realtime reconnect** (`src/realtime-supervisor.ts`). Exponential backoff + ±20% jitter, capped at `reconnectMaxMs` (default 60 s). User notices suppressed until the channel has been down for `escalateAfterMs` (default 30 s). JWT-expired errors trigger a session refresh before retrying. Applied to both the per-project `postgres_changes` subscription and the per-file CRDT broadcast channels.
+- **Structured logging** (`src/logger.ts`). Ring buffer (default 1000 entries), four levels, in-app log panel modal with live filtering by level + scope, and "Copy diagnostics" command that exports a redacted bundle (URLs reduced to host+path, keys/tokens masked).
+- **Rebalance command** (`src/rebalance.ts`). When the project set changes, moves rows + storage objects to their new shards. Resumable — progress is persisted to `data.json` so an interrupted rebalance can be resumed.
+- **At-rest password obfuscation** (`src/secret-storage.ts`). Passwords no longer stored plaintext in `data.json`; XOR'd with a vault-id-derived key. Documented honestly in the README as obfuscation rather than encryption.
+- New commands: `Open log panel`, `Open setup wizard`, `Copy diagnostics to clipboard`, `Rebalance projects`.
+
+### Changed
+
+- **Breaking: settings shape.** Top-level credential fields move into `projects[]`. v1 settings are migrated automatically on first load (`src/migration.ts`); single-project users see no behavioral change.
+- **Setup UX.** The "Run full setup" button is replaced with the wizard modal. The PAT is asked just-in-time and never persisted to `data.json`.
+- **Status bar.** Shows aggregate state across all enabled projects (`N/M synced`).
+- **Realtime user Notices.** Brief outages now stay silent (status bar shows 🟠 immediately; only the Notice is debounced).
+- **Per-file CRDT channels** (`src/realtime-crdt.ts`) now use the supervisor. Previously they silently swallowed `CHANNEL_ERROR` / `TIMED_OUT` / `CLOSED`.
+- README rewritten end-to-end around the new flow.
+
+### Fixed
+
+- Sustained realtime outages on the per-file CRDT channel no longer go undiagnosed.
+- Sync no longer fails opaquely on JWT expiry — the supervisor refreshes the session and retries.
+
+### Migration notes
+
+- v1 → v2 settings migration is automatic. Existing single-project users keep working without action.
+- To opt into multi-project sharding, add a second project in settings and run "Rebalance projects".
+- Minimum Obsidian version unchanged (0.25.0).
+
 ## [1.1.5] - 2026-03-25
 
 ### Fixed

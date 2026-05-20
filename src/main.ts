@@ -1,101 +1,48 @@
 import {
 	Notice,
 	Plugin,
-	requestUrl,
 	TAbstractFile,
 	TFile,
 	Vault,
 } from "obsidian";
 
-const SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS vault_files (
-  id           text primary key,
-  vault_id     text not null,
-  path         text not null,
-  content      text,
-  storage_path text,
-  is_binary    boolean default false,
-  frontmatter  jsonb,
-  tags         text[],
-  mtime        bigint not null,
-  ctime        bigint not null,
-  size         bigint not null,
-  deleted      boolean default false,
-  updated_at   timestamptz default now(),
-  user_id      uuid references auth.users(id),
-  platform     text default 'all'
-);
-ALTER TABLE vault_files ADD COLUMN IF NOT EXISTS frontmatter jsonb;
-ALTER TABLE vault_files ADD COLUMN IF NOT EXISTS tags text[];
-ALTER TABLE vault_files ADD COLUMN IF NOT EXISTS platform text DEFAULT 'all';
-CREATE INDEX IF NOT EXISTS vault_files_vault_path ON vault_files(vault_id, path);
-CREATE INDEX IF NOT EXISTS vault_files_vault_mtime ON vault_files(vault_id, mtime);
-CREATE INDEX IF NOT EXISTS vault_files_tags ON vault_files USING gin(tags);
-ALTER TABLE vault_files ENABLE ROW LEVEL SECURITY;
-DO $$ BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_policies
-    WHERE tablename='vault_files' AND policyname='Users manage own vault'
-  ) THEN
-    CREATE POLICY "Users manage own vault" ON vault_files FOR ALL
-      USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
-  END IF;
-END $$;
-DO $$ BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_publication_tables
-    WHERE pubname='supabase_realtime' AND tablename='vault_files'
-  ) THEN
-    ALTER PUBLICATION supabase_realtime ADD TABLE vault_files;
-  END IF;
-END $$;
-`.trim();
-
-const STORAGE_RLS_SQL = `
-DO $$ BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_policies
-    WHERE tablename='objects' AND schemaname='storage'
-    AND policyname='Users manage own attachments'
-  ) THEN
-    CREATE POLICY "Users manage own attachments"
-      ON storage.objects FOR ALL
-      USING (auth.uid()::text = (storage.foldername(name))[1])
-      WITH CHECK (auth.uid()::text = (storage.foldername(name))[1]);
-  END IF;
-END $$;
-`.trim();
-
-function extractErrorMessage(body: string, status: number): string {
-	try {
-		const parsed = JSON.parse(body) as Record<string, unknown>;
-		if (typeof parsed.message === "string") return parsed.message;
-		if (typeof parsed.error === "string") return parsed.error;
-	} catch {
-		// Ignore
-	}
-	return body.trim() || `HTTP ${status}`;
-}
-import { SupabaseClient } from "@supabase/supabase-js";
 import {
 	DEFAULT_SETTINGS,
+	ProjectStatusView,
+	SettingsTabHost,
 	SupaBaseJumpSettings,
 	SupaBaseJumpSettingTab,
 } from "./settings";
-import { SupabaseManager, SyncStatus } from "./supabase";
-import { SyncEngine, VaultFileRow } from "./sync";
+import { migrateSettings } from "./migration";
+import { newHashSalt } from "./routing";
+import { ProjectClientPool, ProjectStatusState } from "./project-client-pool";
+import { SyncEngine, SyncStatus, VaultFileRow } from "./sync";
 import { RealtimeCrdtManager } from "./realtime-crdt";
+import { logger } from "./logger";
+import { LogPanelModal } from "./log-panel";
+import { SetupWizardModal, WizardMode } from "./setup-wizard";
+import { rebalance } from "./rebalance";
 
-export default class SupaBaseJumpPlugin extends Plugin {
-	settings: SupaBaseJumpSettings;
-	statusBarItem: HTMLElement;
+const STATUS_ICON: Record<ProjectStatusState, string> = {
+	offline: "🔴",
+	connecting: "🟡",
+	syncing: "🔄",
+	synced: "🟢",
+	degraded: "🟠",
+	error: "⚠️",
+};
 
-	private manager: SupabaseManager;
-	private syncEngine: SyncEngine;
-	private crdtManager: RealtimeCrdtManager;
+export default class SupaBaseJumpPlugin extends Plugin implements SettingsTabHost {
+	settings!: SupaBaseJumpSettings;
+	statusBarItem!: HTMLElement;
 
-	get supabase(): SupabaseClient | null {
-		return this.manager.client;
+	private pool!: ProjectClientPool;
+	private syncEngine!: SyncEngine;
+	private crdtManager!: RealtimeCrdtManager;
+	private detachPoolListener: (() => void) | null = null;
+
+	get pool_(): ProjectClientPool {
+		return this.pool;
 	}
 
 	get vault(): Vault {
@@ -104,86 +51,204 @@ export default class SupaBaseJumpPlugin extends Plugin {
 
 	async onload() {
 		await this.loadSettings();
+		logger.configure(this.settings.logging.level, this.settings.logging.bufferSize);
+		logger.info("plugin", "load", { version: this.manifest.version });
 
 		this.statusBarItem = this.addStatusBarItem();
-		this.manager = new SupabaseManager(this);
-		this.manager.setStatus("offline");
-		this.syncEngine = new SyncEngine(this);
+		this.pool = new ProjectClientPool(this.settings);
+		this.detachPoolListener = this.pool.addStatusListener(() => this.refreshStatusBar());
+		this.refreshStatusBar();
+
+		this.syncEngine = new SyncEngine({
+			vault: this.app.vault,
+			settings: this.settings,
+			pool: this.pool,
+			saveSettings: () => this.saveSettings(),
+			setStatus: (status) => this.setStatus(status),
+		});
+
 		this.crdtManager = new RealtimeCrdtManager(this);
+		this.crdtManager.configure(this.pool, this.settings.vaultId, this.settings.realtime);
 
 		this.addSettingTab(new SupaBaseJumpSettingTab(this.app, this));
 		this.registerVaultEvents();
 		this.registerCommands();
 
-		if (this.settings.supabaseUrl && this.settings.email) {
-			await this.initSupabase();
+		if (this.settings.projects.length > 0) {
+			await this.connectAll();
 		}
 	}
 
 	onunload() {
 		this.cleanup();
+		this.detachPoolListener?.();
+		logger.info("plugin", "unload");
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign(
-			{},
-			DEFAULT_SETTINGS,
-			(await this.loadData()) as Partial<SupaBaseJumpSettings>,
-		);
+		const raw: unknown = await this.loadData();
+		this.settings = migrateSettings(raw);
+		if (!this.settings.routing.hashSalt) {
+			this.settings.routing.hashSalt = newHashSalt();
+		}
+		if (!this.settings.vaultId) {
+			this.settings.vaultId = window.crypto.randomUUID().replace(/-/g, "").slice(0, 12);
+		}
+		await this.saveSettings();
 	}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+		logger.configure(this.settings.logging.level, this.settings.logging.bufferSize);
+		this.crdtManager?.configure(this.pool, this.settings.vaultId, this.settings.realtime);
 	}
 
 	setStatus(status: SyncStatus): void {
-		this.manager.setStatus(status);
+		// Aggregate setStatus from the sync engine maps to a transient state on top
+		// of per-project status. We pin the next refresh to the requested state.
+		this.statusBarItem.setText(`${STATUS_ICON[status]} ${this.pool.aggregateLabel()}`);
 	}
 
-	async initSupabase(): Promise<void> {
+	private refreshStatusBar(): void {
+		const state = this.pool.getAggregateState();
+		const label = this.pool.aggregateLabel();
+		this.statusBarItem.setText(`${STATUS_ICON[state]} ${label}`);
+	}
+
+	async connectAll(): Promise<void> {
 		this.syncEngine.stopAll();
 		this.crdtManager.stop();
+		this.pool.syncFromSettings();
 
-		await this.manager.init();
+		const results = await this.pool.connectAll();
+		const ok = results.filter((r) => r.ok).length;
+		const total = results.length;
+		logger.info("plugin", `connect summary`, { ok, total });
+		if (ok === 0 && total > 0) {
+			new Notice(
+				`Supabase jump: no projects connected. ${results.map((r) => r.detail).filter(Boolean).join(" / ")}`,
+				8000,
+			);
+		} else if (ok < total) {
+			new Notice(`Supabase jump: ${ok}/${total} projects connected — see log panel for details`, 6000);
+		}
 
-		if (!this.supabase) return; // connection failed - manager already reported error
-
-		this.crdtManager.setSupabase(this.supabase, this.settings.vaultId);
 		this.crdtManager.start();
-
-		this.syncEngine.crdtIsActive = (path) =>
-			this.crdtManager.isActiveFile(path);
-
-		this.syncEngine.startRealtimeListener();
+		this.syncEngine.crdtIsActive = (path) => this.crdtManager.isActiveFile(path);
+		this.syncEngine.startRealtimeListeners();
 		this.syncEngine.startConfigWatcher();
-
 		if (this.settings.syncIntervalMinutes > 0) {
 			this.syncEngine.startAutoSync();
 		}
-
 		if (this.settings.syncOnStartup) {
-			this.syncEngine
-				.fullSync()
-				.catch((err) =>
-					console.error("Supabase jump: Startup sync error", err),
-				);
+			this.syncEngine.fullSync().catch((err) =>
+				logger.error("plugin", `startup sync failed`, {
+					error: err instanceof Error ? err.message : String(err),
+				}),
+			);
 		}
 	}
 
-	async signIn(): Promise<void> {
-		await this.manager.signIn();
-	}
-
-	async signOut(): Promise<void> {
+	async signOutAll(): Promise<void> {
 		this.syncEngine.stopAll();
 		this.crdtManager.stop();
-		await this.manager.signOut();
+		await this.pool.signOutAll();
 	}
 
 	cleanup(): void {
-		this.syncEngine.stopAll();
-		this.crdtManager.stop();
-		this.manager.cleanup();
+		this.syncEngine?.stopAll();
+		this.crdtManager?.stop();
+		this.pool?.cleanup();
+	}
+
+	async fullSync(): Promise<void> {
+		await this.syncEngine.fullSync();
+	}
+
+	async fetchNow(): Promise<void> {
+		await this.syncEngine.fetchOnly();
+	}
+
+	openSetupWizard(mode: WizardMode, projectId?: string): void {
+		new SetupWizardModal(
+			this.app,
+			{
+				settings: this.settings,
+				pool: this.pool,
+				saveSettings: () => this.saveSettings(),
+				connectProject: async (id) => {
+					const project = this.settings.projects.find((p) => p.id === id);
+					if (project) await this.pool.connect(project);
+				},
+				refreshSettingsUi: () => this.refreshSettingsTab(),
+			},
+			mode,
+			projectId,
+		).open();
+	}
+
+	openLogPanel(): void {
+		new LogPanelModal(this.app).open();
+	}
+
+	async copyDiagnostics(): Promise<void> {
+		const meta = {
+			pluginVersion: this.manifest.version,
+			obsidianVersion: (this.app as unknown as { isMobile?: boolean }).isMobile ? "mobile" : "desktop",
+			settings: this.settings,
+		};
+		const text = logger.exportDiagnostics(meta);
+		try {
+			await navigator.clipboard.writeText(text);
+			new Notice("Supabase jump: diagnostics copied to clipboard");
+		} catch {
+			new Notice("Supabase jump: clipboard unavailable — open the log panel to copy manually");
+		}
+	}
+
+	async rebalanceNow(): Promise<void> {
+		await rebalance({
+			settings: this.settings,
+			pool: this.pool,
+			saveSettings: () => this.saveSettings(),
+		});
+	}
+
+	async removeProject(projectId: string): Promise<void> {
+		this.settings.projects = this.settings.projects.filter((p) => p.id !== projectId);
+		await this.saveSettings();
+		this.pool.syncFromSettings();
+		this.syncEngine.startRealtimeListeners();
+		this.refreshStatusBar();
+	}
+
+	async toggleProject(projectId: string, enabled: boolean): Promise<void> {
+		const project = this.settings.projects.find((p) => p.id === projectId);
+		if (!project) return;
+		project.enabled = enabled;
+		await this.saveSettings();
+		this.pool.syncFromSettings();
+		if (enabled) {
+			await this.pool.connect(project);
+		} else {
+			this.pool.updateStatus(projectId, "offline", "disabled");
+		}
+		this.syncEngine.startRealtimeListeners();
+		this.refreshStatusBar();
+	}
+
+	getProjectStatus(projectId: string): ProjectStatusView {
+		return this.pool.getStatus(projectId);
+	}
+
+	getTotalUsageBytes(): number {
+		return this.settings.projects.reduce((acc, p) => acc + (p.lastUsedBytes ?? 0), 0);
+	}
+
+	private refreshSettingsTab(): void {
+		const tabs = (this.app as unknown as { setting?: { activeTab?: { display?: () => void } } }).setting;
+		tabs?.activeTab?.display?.();
+		this.refreshStatusBar();
 	}
 
 	private registerCommands(): void {
@@ -200,11 +265,11 @@ export default class SupaBaseJumpPlugin extends Plugin {
 			id: "force-sync",
 			name: "Force sync now",
 			callback: () => {
-				this.syncEngine
-					.fullSync()
-					.catch((err) =>
-						console.error("Supabase jump: Force sync error", err),
-					);
+				this.syncEngine.fullSync().catch((err) =>
+					logger.error("plugin", `command force-sync failed`, {
+						error: err instanceof Error ? err.message : String(err),
+					}),
+				);
 			},
 		});
 
@@ -212,11 +277,48 @@ export default class SupaBaseJumpPlugin extends Plugin {
 			id: "fetch-now",
 			name: "Fetch from database",
 			callback: () => {
-				this.syncEngine
-					.fetchOnly()
-					.catch((err) =>
-						console.error("Supabase jump: Fetch error", err),
-					);
+				this.syncEngine.fetchOnly().catch((err) =>
+					logger.error("plugin", `command fetch-now failed`, {
+						error: err instanceof Error ? err.message : String(err),
+					}),
+				);
+			},
+		});
+
+		this.addCommand({
+			id: "open-log-panel",
+			name: "Open log panel",
+			callback: () => this.openLogPanel(),
+		});
+
+		this.addCommand({
+			id: "open-setup-wizard",
+			name: "Open setup wizard",
+			callback: () =>
+				this.openSetupWizard(this.settings.projects.length === 0 ? "first-run" : "add-project"),
+		});
+
+		this.addCommand({
+			id: "copy-diagnostics",
+			name: "Copy diagnostics to clipboard",
+			callback: () => {
+				this.copyDiagnostics().catch((err) =>
+					logger.error("plugin", `copy diagnostics failed`, {
+						error: err instanceof Error ? err.message : String(err),
+					}),
+				);
+			},
+		});
+
+		this.addCommand({
+			id: "rebalance-projects",
+			name: "Rebalance projects",
+			callback: () => {
+				this.rebalanceNow().catch((err) =>
+					logger.error("plugin", `command rebalance failed`, {
+						error: err instanceof Error ? err.message : String(err),
+					}),
+				);
 			},
 		});
 	}
@@ -229,7 +331,6 @@ export default class SupaBaseJumpPlugin extends Plugin {
 				}
 			}),
 		);
-
 		this.registerEvent(
 			this.app.vault.on("modify", (file: TAbstractFile) => {
 				if (file instanceof TFile) {
@@ -237,7 +338,6 @@ export default class SupaBaseJumpPlugin extends Plugin {
 				}
 			}),
 		);
-
 		this.registerEvent(
 			this.app.vault.on("delete", (file: TAbstractFile) => {
 				if (file instanceof TFile) {
@@ -245,17 +345,13 @@ export default class SupaBaseJumpPlugin extends Plugin {
 				}
 			}),
 		);
-
 		this.registerEvent(
-			this.app.vault.on(
-				"rename",
-				(file: TAbstractFile, oldPath: string) => {
-					if (file instanceof TFile) {
-						this.syncEngine.queueChange(oldPath, "delete");
-						this.syncEngine.queueChange(file.path, "push");
-					}
-				},
-			),
+			this.app.vault.on("rename", (file: TAbstractFile, oldPath: string) => {
+				if (file instanceof TFile) {
+					this.syncEngine.queueChange(oldPath, "delete");
+					this.syncEngine.queueChange(file.path, "push");
+				}
+			}),
 		);
 	}
 
@@ -263,8 +359,8 @@ export default class SupaBaseJumpPlugin extends Plugin {
 		await this.syncEngine.pushFile(file);
 	}
 
-	async pullFile(row: VaultFileRow): Promise<void> {
-		await this.syncEngine.pullFile(row);
+	async pullFile(row: VaultFileRow, projectId: string): Promise<void> {
+		await this.syncEngine.pullFile(row, projectId);
 	}
 
 	async deleteRemoteFile(path: string): Promise<void> {
@@ -274,111 +370,7 @@ export default class SupaBaseJumpPlugin extends Plugin {
 	async ensureFolder(filePath: string): Promise<void> {
 		await this.syncEngine.ensureFolder(filePath);
 	}
-
-	async fullSync(): Promise<void> {
-		await this.syncEngine.fullSync();
-	}
-
-	async fetchNow(): Promise<void> {
-		await this.syncEngine.fetchOnly();
-	}
-
-	async initializeSchema(onProgress: (step: number) => void): Promise<void> {
-		const { supabaseUrl, personalAccessToken } = this.settings;
-
-		if (!supabaseUrl) throw new Error("Project URL is required.");
-		if (!personalAccessToken)
-			throw new Error("Personal Access Token is required.");
-
-		const ref = new URL(supabaseUrl).hostname.split(".")[0];
-
-		const headers: Record<string, string> = {
-			Authorization: `Bearer ${personalAccessToken}`,
-			"Content-Type": "application/json",
-		};
-
-		const dbQueryUrl = `https://api.supabase.com/v1/projects/${ref}/database/query`;
-		const bucketsUrl = `https://api.supabase.com/v1/projects/${ref}/storage/buckets`;
-
-		const runSQL = async (query: string): Promise<void> => {
-			const res = await requestUrl({
-				url: dbQueryUrl,
-				method: "POST",
-				headers,
-				body: JSON.stringify({ query }),
-				throw: false,
-			});
-			if (res.status < 200 || res.status >= 300) {
-				throw new Error(extractErrorMessage(res.text, res.status));
-			}
-		};
-
-		onProgress(1);
-		try {
-			await runSQL(SCHEMA_SQL);
-		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			console.error("Supabase jump: Setup step 1 failed", err);
-			new Notice(`Setup failed at step 1: ${msg}`, 10000);
-			throw err;
-		}
-
-		onProgress(2);
-		{
-			let bucketOk = false;
-			try {
-				const res = await requestUrl({
-					url: bucketsUrl,
-					method: "POST",
-					headers,
-					body: JSON.stringify({
-						id: "vault-attachments",
-						name: "vault-attachments",
-						public: false,
-					}),
-					throw: false,
-				});
-				bucketOk =
-					res.status === 409 ||
-					(res.status >= 200 && res.status < 300);
-				if (!bucketOk) {
-					const msg = extractErrorMessage(res.text, res.status);
-					console.warn(
-						"Supabase jump: bucket creation via API failed -",
-						msg,
-					);
-				}
-			} catch (err) {
-				console.warn(
-					"Supabase jump: Bucket creation request failed -",
-					err,
-				);
-			}
-
-			if (!bucketOk) {
-				new Notice(
-					"Supabase jump: Could not auto-create Storage bucket.\n\n" +
-					"Create it manually: Supabase \u2192 Storage \u2192 New bucket\n" +
-					"  Name: vault-attachments\n" +
-					"  Public: OFF\n\n" +
-					"Then continue - The RLS policy was applied in step 3.",
-					14000,
-				);
-			}
-		}
-
-		onProgress(3);
-		try {
-			await runSQL(STORAGE_RLS_SQL);
-		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			console.error("Supabase jump: Setup Step 3 failed", err);
-			new Notice(`Setup failed at step 3: ${msg}`, 10000);
-			throw err;
-		}
-
-		new Notice(
-			"Supabase jump: all set - table, bucket, and realtime enabled ✓",
-		);
-	}
 }
+
+// Preserve a tiny default-settings constant for any external code that may still import it.
+export const DEFAULT_SETTINGS_EXPORT = DEFAULT_SETTINGS;
