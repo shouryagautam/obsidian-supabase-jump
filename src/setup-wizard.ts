@@ -234,6 +234,7 @@ export class SetupWizardModal extends Modal {
 			text: this.mode === "edit-project" ? "Edit project" : "Set up a Supabase project",
 		});
 
+		this.renderTransfer(root);
 		this.renderCredentials(root);
 		if (this.mode !== "edit-project") {
 			this.renderSchema(root);
@@ -242,6 +243,119 @@ export class SetupWizardModal extends Modal {
 		this.renderAuth(root);
 		this.renderProbe(root);
 		this.renderFinish(root);
+	}
+
+	private renderTransfer(root: HTMLElement): void {
+		new Setting(root).setName("Transfer setup").setHeading();
+
+		root.createEl("p", {
+			text: "Copy one string to set up the same project on another device. Password and PAT are never included — you'll enter those fresh.",
+			cls: "sbj-help",
+		});
+
+		new Setting(root)
+			.setName("Export this project")
+			.setDesc("Copies URL + anon key + email + vault ID + label to your clipboard.")
+			.addButton((btn) =>
+				btn.setButtonText("Copy export string").onClick(async () => {
+					const blob = this.buildExportBlob();
+					if (!blob) {
+						new Notice("Supabase jump: fill in URL, anon key, and email first.");
+						return;
+					}
+					try {
+						await navigator.clipboard.writeText(blob);
+						new Notice("Supabase jump: setup copied to clipboard.");
+					} catch (err) {
+						new Notice(
+							`Supabase jump: clipboard write failed — ${err instanceof Error ? err.message : String(err)}`,
+						);
+					}
+				}),
+			);
+
+		if (this.mode !== "edit-project") {
+			let importValue = "";
+			new Setting(root)
+				.setName("Import setup")
+				.setDesc("Paste an export string here, then click Apply.")
+				.addText((t) =>
+					t.setPlaceholder("eyJ2Ijox…").onChange((v) => {
+						importValue = v.trim();
+					}),
+				)
+				.addButton((btn) =>
+					btn.setButtonText("Apply").onClick(async () => {
+						if (!this.applyImportBlob(importValue)) return;
+						await this.persistDraft();
+						new Notice(
+							"Supabase jump: setup imported. Enter your password (or send OTP) below to sign in.",
+						);
+						this.render();
+					}),
+				);
+		}
+	}
+
+	private buildExportBlob(): string | null {
+		const d = this.state.draft;
+		if (!d.supabaseUrl || !d.supabaseAnonKey || !d.email) return null;
+		const payload = {
+			v: 1,
+			label: d.label,
+			supabaseUrl: d.supabaseUrl,
+			supabaseAnonKey: d.supabaseAnonKey,
+			authMethod: d.authMethod,
+			email: d.email,
+			vaultId: this.host.settings.vaultId,
+		};
+		try {
+			return btoa(JSON.stringify(payload));
+		} catch {
+			return null;
+		}
+	}
+
+	private applyImportBlob(raw: string): boolean {
+		if (!raw) {
+			new Notice("Supabase jump: import string is empty.");
+			return false;
+		}
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(atob(raw));
+		} catch {
+			new Notice("Supabase jump: could not decode import string.");
+			return false;
+		}
+		if (typeof parsed !== "object" || parsed === null) {
+			new Notice("Supabase jump: import payload is invalid.");
+			return false;
+		}
+		const p = parsed as Record<string, unknown>;
+		if (p.v !== 1) {
+			new Notice("Supabase jump: unsupported import version.");
+			return false;
+		}
+		if (
+			typeof p.supabaseUrl !== "string" ||
+			typeof p.supabaseAnonKey !== "string" ||
+			typeof p.email !== "string"
+		) {
+			new Notice("Supabase jump: required fields missing in import.");
+			return false;
+		}
+		if (typeof p.label === "string" && p.label) this.state.draft.label = p.label;
+		this.state.draft.supabaseUrl = p.supabaseUrl;
+		this.state.draft.supabaseAnonKey = p.supabaseAnonKey;
+		this.state.draft.email = p.email;
+		if (p.authMethod === "password" || p.authMethod === "magic_link") {
+			this.state.draft.authMethod = p.authMethod;
+		}
+		if (typeof p.vaultId === "string" && p.vaultId) {
+			this.host.settings.vaultId = p.vaultId;
+		}
+		return true;
 	}
 
 	private renderCredentials(root: HTMLElement): void {
