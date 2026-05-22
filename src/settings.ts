@@ -60,6 +60,11 @@ export interface SupaBaseJumpSettings {
 	excludedFolders: string[];
 	platformExcludedPaths: string[];
 	lastSyncTime: number;
+	// Per-project incremental cursor: updated_at high-water mark of the last
+	// successful fetch for each project. Falls back to `lastSyncTime` when an
+	// entry is missing, so settings saved before this field existed still
+	// resume incrementally instead of triggering a full re-pull.
+	projectSyncCursors: Record<string, number>;
 	// Experimental sub-second co-edit via Yjs broadcast channels. Disabled by
 	// default because the current init flow (both peers seed Y.Text with disk
 	// content independently) produces duplicated content when the same note is
@@ -87,6 +92,7 @@ export const DEFAULT_SETTINGS: SupaBaseJumpSettings = {
 	excludedFolders: [],
 	platformExcludedPaths: [],
 	lastSyncTime: 0,
+	projectSyncCursors: {},
 	coEditEnabled: false,
 };
 

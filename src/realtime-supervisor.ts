@@ -18,7 +18,10 @@ export interface SuperviseOptions {
 	client: SupabaseClient;
 	build: (client: SupabaseClient) => RealtimeChannel;
 	onStatus?: (state: "up" | "down" | "retrying") => void;
-	onSubscribed?: () => void;
+	// `isReconnect` is true when we re-attach after at least one CHANNEL_ERROR /
+	// TIMED_OUT / CLOSED. Callers use this to trigger a catch-up fetch for the
+	// window when realtime events may have been missed.
+	onSubscribed?: (isReconnect: boolean) => void;
 	onJwtExpired?: () => Promise<boolean>;  // resolve true on refresh success
 }
 
@@ -115,6 +118,7 @@ export function superviseChannel(opts: SuperviseOptions): SupervisedChannel {
 		current.subscribe((status: SubscribeStatus) => {
 			if (stopped) return;
 			if (status === "SUBSCRIBED") {
+				const isReconnect = attempt > 0;
 				up = true;
 				attempt = 0;
 				downSince = 0;
@@ -124,9 +128,9 @@ export function superviseChannel(opts: SuperviseOptions): SupervisedChannel {
 					escalateTimer = null;
 				}
 				setStatus("up");
-				logger.info(scope, `realtime channel subscribed`, { label });
+				logger.info(scope, `realtime channel subscribed`, { label, isReconnect });
 				try {
-					opts.onSubscribed?.();
+					opts.onSubscribed?.(isReconnect);
 				} catch (err) {
 					logger.warn(scope, `onSubscribed handler threw`, {
 						error: err instanceof Error ? err.message : String(err),

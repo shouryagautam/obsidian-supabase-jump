@@ -5,6 +5,31 @@ All notable changes to SupaBase Jump will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-05-22
+
+Sync-reliability overhaul. The write protocol is now race-free, deletions propagate to offline peers, and edits made while disconnected are no longer dropped.
+
+### Added
+
+- **Server-side conditional LWW** (`src/sync.ts` — `upsertRowSafely`). Every push now issues `UPDATE … WHERE id=X AND (mtime < new OR deleted=true)`; on zero rows matched it falls back to `INSERT`; on PK collision it probes the row and either skips (peer wrote a newer copy) or retries. The previous read-then-upsert had a several-hundred-millisecond window where two peers could each overwrite the other.
+- **Tombstone replay on fetch.** `collectRemoteState` no longer filters `deleted=false`; rows with `deleted=true` updated since each project's cursor flow through and the local file is trashed (unless the local copy is newer than the tombstone — the resurrect case is then pushed by the next `fullSync`). Previously, a delete made on device A while device B was offline never reached device B unless realtime caught it.
+- **Per-project sync cursors** (`settings.projectSyncCursors`). Each enabled project advances its own `updated_at` high-water mark independently. A transient outage on one project no longer poisons the global cursor for the others. Falls back to the legacy `lastSyncTime` for settings saved before this field existed, so existing installs resume incrementally instead of doing a one-time full re-pull.
+- **Catch-up fetch on realtime reconnect.** `superviseChannel` now distinguishes a first subscribe from a re-subscribe after `CHANNEL_ERROR` / `TIMED_OUT` / `CLOSED`; on reconnect the sync engine schedules a debounced `fetchOnly()` + `flushNow()` so events missed during the outage are reconciled.
+- **Single-flight sync.** Concurrent `fullSync` / `fetchOnly` invocations dedupe to one shared in-flight promise. Auto-sync + startup sync + a force-sync click no longer overlap, race on the cursor write, or duplicate work.
+- **Empty-folder pruning after deletion.** `deleteLocalFile` now walks up the parent chain and removes any folder that becomes empty, stopping at the first non-empty ancestor or the vault root.
+
+### Changed
+
+- **Don't drop edits made while disconnected.** `flushQueue` no longer clears the change queue when zero projects are connected; edits stay queued and are drained by a new `flushNow()` call after `connectAll` succeeds (and after each realtime reconnect).
+- **Multi-shard tiebreak** (`acceptRemoteRow`) now picks the row with the newer `updated_at` first; the "expected shard" rule is only consulted on exact `updated_at` ties. Previously, during a rebalance window, the expected shard's stale copy could shadow a newer copy on the off-shard project.
+- **`PULL_IGNORE_TTL`** raised from 1500 ms to 5000 ms. Slow vault writes (large binaries, mobile) were letting the modify-event echo leak past the ignore set and re-push the content we'd just pulled.
+- **`removeProject`** now drops that project's entry from `projectSyncCursors` so the map can't grow unboundedly across add/remove cycles.
+
+### Fixed
+
+- **Hard-DELETE realtime path retired.** The old handler read `oldRow.path`, which Postgres realtime only ships when `REPLICA IDENTITY FULL` is set on the table — otherwise it's undefined and the deletion was silently ignored. Replaced with a debug log; soft-delete (`deleted=true` UPDATE) is the only protocol the plugin uses.
+- **`flushQueue` errors** are now `logger.warn`'d per failing path instead of silently swallowed.
+
 ## [2.0.0] - 2026-05-20
 
 ### Added

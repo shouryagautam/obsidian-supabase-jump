@@ -161,6 +161,9 @@ export default class SupaBaseJumpPlugin extends Plugin implements SettingsTabHos
 		if (this.settings.syncIntervalMinutes > 0) {
 			this.syncEngine.startAutoSync();
 		}
+		// Drain any edits queued while disconnected (queueChange keeps the queue
+		// when no projects are available; flushNow runs them now that some are).
+		if (ok > 0) this.syncEngine.flushNow();
 		if (this.settings.syncOnStartup) {
 			this.syncEngine.fullSync().catch((err) =>
 				logger.error("plugin", `startup sync failed`, {
@@ -241,6 +244,7 @@ export default class SupaBaseJumpPlugin extends Plugin implements SettingsTabHos
 
 	async removeProject(projectId: string): Promise<void> {
 		this.settings.projects = this.settings.projects.filter((p) => p.id !== projectId);
+		delete this.settings.projectSyncCursors[projectId];
 		await this.saveSettings();
 		this.pool.syncFromSettings();
 		this.syncEngine.startRealtimeListeners();

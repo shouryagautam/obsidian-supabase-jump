@@ -58,10 +58,18 @@ function ensureV2Defaults(partial: Partial<SupaBaseJumpSettings>): SupaBaseJumpS
 		projects: (partial.projects ?? []).map(normalizeProject),
 		excludedFolders: partial.excludedFolders ?? [],
 		platformExcludedPaths: partial.platformExcludedPaths ?? [],
+		projectSyncCursors: { ...(partial.projectSyncCursors ?? {}) },
 	};
 
 	if (!out.routing.hashSalt) {
 		out.routing.hashSalt = newHashSalt();
+	}
+
+	// Drop cursors for projects that no longer exist so the map can't grow
+	// unboundedly across add/remove cycles.
+	const liveIds = new Set(out.projects.map((p) => p.id));
+	for (const id of Object.keys(out.projectSyncCursors)) {
+		if (!liveIds.has(id)) delete out.projectSyncCursors[id];
 	}
 
 	out.schemaVersion = SETTINGS_SCHEMA_VERSION;
@@ -121,6 +129,7 @@ function migrateV1ToV2(v1: LegacyV1Settings): SupaBaseJumpSettings {
 		excludedFolders: v1.excludedFolders ?? [],
 		platformExcludedPaths: v1.platformExcludedPaths ?? [],
 		lastSyncTime: v1.lastSyncTime ?? 0,
+		projectSyncCursors: {},
 		coEditEnabled: false,
 	};
 

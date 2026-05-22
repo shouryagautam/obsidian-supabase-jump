@@ -10,8 +10,11 @@ import { logger } from "./logger";
 const STORAGE_BUCKET = "vault-attachments";
 const DB_TABLE = "vault_files";
 const DEBOUNCE_MS = 1000;
-const PULL_IGNORE_TTL = 1500;
+// 5s covers slow vault writes on mobile / large binaries. Anything shorter let
+// the modify-event echo leak past the ignore set and re-push what we just pulled.
+const PULL_IGNORE_TTL = 5000;
 const CONFIG_WATCH_MS = 5000;
+const RECONNECT_FETCH_DEBOUNCE_MS = 1500;
 
 export type SyncStatus = ProjectStatusState;
 
@@ -64,6 +67,11 @@ interface RemoteLocation {
 	row: VaultFileRow;
 }
 
+interface RemoteState {
+	rows: Map<string, RemoteLocation>;
+	succeeded: Set<string>;
+}
+
 export class SyncEngine {
 	private host: SyncHost;
 	private changeQueue = new Map<string, "push" | "delete">();
@@ -73,6 +81,8 @@ export class SyncEngine {
 	private configFileCache = new Map<string, number>();
 	private ignorePaths = new Set<string>();
 	private realtimeChannels = new Map<string, SupervisedChannel>();
+	private syncInFlight: Promise<void> | null = null;
+	private reconnectFetchTimer: number | null = null;
 
 	crdtIsActive: ((path: string) => boolean) | null = null;
 
@@ -187,6 +197,80 @@ export class SyncEngine {
 		}
 	}
 
+	// Server-side LWW write: only persists the row when remote is older or
+	// already tombstoned, with an INSERT fallback for new ids and a probe on
+	// PK collision (race between our UPDATE-returning-0-rows and a peer INSERT).
+	// Returns `applied=false` when the remote already holds a newer copy — the
+	// caller should not surface this as an error.
+	private async upsertRowSafely(
+		client: SupabaseClient,
+		payload: Record<string, unknown> & { id: string; mtime: number },
+	): Promise<{ applied: boolean; reason?: string }> {
+		const updateResult = await client
+			.from(DB_TABLE)
+			.update(payload)
+			.eq("id", payload.id)
+			.or(`mtime.lt.${payload.mtime},deleted.eq.true`)
+			.select("id");
+		if (updateResult.error) {
+			throw new Error(`update failed — ${updateResult.error.message}`);
+		}
+		if ((updateResult.data?.length ?? 0) > 0) return { applied: true };
+
+		// 0 rows matched: either row doesn't exist, or remote.mtime >= ours
+		// (and not deleted). Try INSERT; PK collision means the latter.
+		const insertResult = await client.from(DB_TABLE).insert(payload);
+		if (!insertResult.error) return { applied: true };
+		if (insertResult.error.code !== "23505") {
+			throw new Error(`insert failed — ${insertResult.error.message}`);
+		}
+
+		// PK collision. Probe to decide: a peer either won the race or held the
+		// newer copy all along.
+		const probe = await client
+			.from(DB_TABLE)
+			.select("mtime, deleted")
+			.eq("id", payload.id)
+			.maybeSingle<{ mtime: number; deleted: boolean }>();
+		if (probe.error) {
+			throw new Error(`probe failed — ${probe.error.message}`);
+		}
+		if (probe.data && !probe.data.deleted && probe.data.mtime >= payload.mtime) {
+			return { applied: false, reason: "remote newer or equal" };
+		}
+		// Remote is older or deleted now — retry the conditional update.
+		const retry = await client
+			.from(DB_TABLE)
+			.update(payload)
+			.eq("id", payload.id)
+			.or(`mtime.lt.${payload.mtime},deleted.eq.true`)
+			.select("id");
+		if (retry.error) {
+			throw new Error(`update retry failed — ${retry.error.message}`);
+		}
+		return { applied: (retry.data?.length ?? 0) > 0, reason: "raced; retried" };
+	}
+
+	// Cheap precheck used only by the binary push path to avoid uploading bytes
+	// we'd then refuse to write. Returns null when the row is absent or the
+	// read fails; remote-newer cases short-circuit the upload entirely.
+	private async peekRemoteMtime(
+		client: SupabaseClient,
+		rowId: string,
+	): Promise<{ mtime: number; deleted: boolean } | null> {
+		try {
+			const { data, error } = await client
+				.from(DB_TABLE)
+				.select("mtime,deleted")
+				.eq("id", rowId)
+				.maybeSingle<{ mtime: number; deleted: boolean }>();
+			if (error || !data) return null;
+			return data;
+		} catch {
+			return null;
+		}
+	}
+
 	private async pushBinaryFile(
 		client: SupabaseClient,
 		file: TFile,
@@ -194,6 +278,18 @@ export class SyncEngine {
 		vaultId: string,
 		rowId: string,
 	): Promise<void> {
+		// Cheap precheck: skip the storage upload too if we'd just refuse the
+		// row write. Storage path is deterministic so an unnecessary upload
+		// would replace whatever the remote-newer peer just uploaded.
+		const peek = await this.peekRemoteMtime(client, rowId);
+		if (peek && !peek.deleted && peek.mtime > file.stat.mtime) {
+			logger.info("sync", `skip push: remote newer for "${file.path}"`, {
+				localMtime: file.stat.mtime,
+				remoteMtime: peek.mtime,
+			});
+			return;
+		}
+
 		const data = await this.host.vault.readBinary(file);
 		const storagePath = toStoragePath(userId, vaultId, file.path);
 
@@ -202,7 +298,7 @@ export class SyncEngine {
 			.upload(storagePath, data, { upsert: true });
 		if (uploadErr) throw new Error(`Storage upload failed — ${uploadErr.message}`);
 
-		const { error: dbErr } = await client.from(DB_TABLE).upsert({
+		const result = await this.upsertRowSafely(client, {
 			id: rowId,
 			user_id: userId,
 			vault_id: vaultId,
@@ -217,7 +313,9 @@ export class SyncEngine {
 			deleted: false,
 			updated_at: new Date().toISOString(),
 		});
-		if (dbErr) throw new Error(`Metadata upsert failed — ${dbErr.message}`);
+		if (!result.applied) {
+			logger.info("sync", `push lost race for "${file.path}"`, { reason: result.reason });
+		}
 	}
 
 	private async pushTextFile(
@@ -235,7 +333,7 @@ export class SyncEngine {
 			? parseFrontmatter(raw)
 			: { properties: {}, tags: [] };
 
-		const { error } = await client.from(DB_TABLE).upsert({
+		const result = await this.upsertRowSafely(client, {
 			id: rowId,
 			user_id: userId,
 			vault_id: vaultId,
@@ -252,7 +350,9 @@ export class SyncEngine {
 			deleted: false,
 			updated_at: new Date().toISOString(),
 		});
-		if (error) throw new Error(`Upsert failed — ${error.message}`);
+		if (!result.applied) {
+			logger.info("sync", `push lost race for "${file.path}"`, { reason: result.reason });
+		}
 	}
 
 	private async pushAdapterFile(
@@ -267,6 +367,15 @@ export class SyncEngine {
 		const rowId = toRowId(vaultId, filePath);
 
 		if (isBinary(filePath)) {
+			const peek = await this.peekRemoteMtime(client, rowId);
+			if (peek && !peek.deleted && peek.mtime > stat.mtime) {
+				logger.info("sync", `skip push: remote newer for "${filePath}"`, {
+					localMtime: stat.mtime,
+					remoteMtime: peek.mtime,
+				});
+				return;
+			}
+
 			const data = await this.host.vault.adapter.readBinary(filePath);
 			const storagePath = toStoragePath(userId, vaultId, filePath);
 
@@ -275,7 +384,7 @@ export class SyncEngine {
 				.upload(storagePath, data, { upsert: true });
 			if (uploadErr) throw new Error(`Storage upload failed — ${uploadErr.message}`);
 
-			const { error: dbErr } = await client.from(DB_TABLE).upsert({
+			const result = await this.upsertRowSafely(client, {
 				id: rowId,
 				user_id: userId,
 				vault_id: vaultId,
@@ -290,7 +399,9 @@ export class SyncEngine {
 				deleted: false,
 				updated_at: new Date().toISOString(),
 			});
-			if (dbErr) throw new Error(`Metadata upsert failed — ${dbErr.message}`);
+			if (!result.applied) {
+				logger.info("sync", `push lost race for "${filePath}"`, { reason: result.reason });
+			}
 		} else {
 			const raw = await this.host.vault.adapter.read(filePath);
 			const content = stripNullBytes(raw);
@@ -299,7 +410,7 @@ export class SyncEngine {
 				? parseFrontmatter(content)
 				: { properties: {}, tags: [] };
 
-			const { error } = await client.from(DB_TABLE).upsert({
+			const result = await this.upsertRowSafely(client, {
 				id: rowId,
 				user_id: userId,
 				vault_id: vaultId,
@@ -316,7 +427,9 @@ export class SyncEngine {
 				deleted: false,
 				updated_at: new Date().toISOString(),
 			});
-			if (error) throw new Error(`Upsert failed — ${error.message}`);
+			if (!result.applied) {
+				logger.info("sync", `push lost race for "${filePath}"`, { reason: result.reason });
+			}
 		}
 	}
 
@@ -461,47 +574,61 @@ export class SyncEngine {
 		await Promise.all(workers);
 	}
 
-	private async collectRemoteRows(sinceMs = 0): Promise<Map<string, RemoteLocation>> {
+	private cursorsForEnabled(): Map<string, number> {
+		const map = new Map<string, number>();
+		for (const rt of this.host.pool.forAllEnabled()) {
+			const stored = this.host.settings.projectSyncCursors[rt.id];
+			// Fall back to the legacy global cursor so settings saved before
+			// projectSyncCursors existed resume incrementally instead of doing
+			// a one-time full re-pull.
+			map.set(rt.id, stored ?? this.host.settings.lastSyncTime ?? 0);
+		}
+		return map;
+	}
+
+	// Query every enabled project for rows updated since each project's own
+	// cursor. Returns *all* matching rows (including tombstones — rows with
+	// deleted=true) so callers can replay deletions for peers that were offline
+	// when the delete happened. Only projects whose query succeeded appear in
+	// `succeeded`; failed projects don't advance their cursor.
+	private async collectRemoteState(cursors: Map<string, number>): Promise<RemoteState> {
 		const { vaultId } = this.host.settings;
-		const remoteMap = new Map<string, RemoteLocation>();
-		// 10-second safety buffer accommodates clock skew and rows whose updated_at
-		// is set on the server slightly after our local timestamp at sync start.
-		const sinceIso = sinceMs > 0 ? new Date(sinceMs - 10_000).toISOString() : null;
+		const winning = new Map<string, RemoteLocation>();
+		const succeeded = new Set<string>();
 
 		for (const rt of this.host.pool.forAllEnabled()) {
+			const sinceMs = cursors.get(rt.id) ?? 0;
+			// 10-second safety buffer absorbs clock skew between client and server.
+			const sinceIso = sinceMs > 0 ? new Date(sinceMs - 10_000).toISOString() : null;
 			const runQuery = () => {
 				const q = rt.client
 					.from(DB_TABLE)
 					.select("*")
-					.eq("vault_id", vaultId)
-					.eq("deleted", false);
+					.eq("vault_id", vaultId);
 				return sinceIso ? q.gt("updated_at", sinceIso) : q;
 			};
 			try {
-				const { data, error } = await runQuery();
-				if (error) {
-					if (isJwtExpired(error)) {
-						const ok = await this.host.pool.refreshSession(rt.id);
-						if (ok) {
-							const retry = await runQuery();
-							if (!retry.error && retry.data) {
-								for (const row of retry.data as VaultFileRow[]) {
-									this.acceptRemoteRow(remoteMap, row, rt.id);
-								}
-								continue;
-							}
-						}
+				let { data, error } = await runQuery();
+				if (error && isJwtExpired(error)) {
+					const ok = await this.host.pool.refreshSession(rt.id);
+					if (ok) {
+						const retry = await runQuery();
+						data = retry.data;
+						error = retry.error;
 					}
+				}
+				if (error) {
 					if (isRlsError(error)) {
 						logger.error("sync", `RLS rejected query`, { projectId: rt.id });
 						new Notice(`Supabase jump: project ${rt.id.slice(0, 6)}… rejected the query — check RLS policy.`);
-						continue;
+					} else {
+						logger.error("sync", `failed to fetch remote rows`, { projectId: rt.id, error: error.message });
 					}
-					logger.error("sync", `failed to fetch remote rows`, { projectId: rt.id, error: error.message });
 					continue;
 				}
+				succeeded.add(rt.id);
 				for (const row of (data as VaultFileRow[]) ?? []) {
-					this.acceptRemoteRow(remoteMap, row, rt.id);
+					this.acceptRemoteRow(winning, row, rt.id);
 				}
 			} catch (err) {
 				logger.error("sync", `remote query threw`, {
@@ -511,7 +638,7 @@ export class SyncEngine {
 			}
 		}
 
-		return remoteMap;
+		return { rows: winning, succeeded };
 	}
 
 	private acceptRemoteRow(
@@ -524,15 +651,49 @@ export class SyncEngine {
 			remoteMap.set(row.path, { projectId, row });
 			return;
 		}
-		// Two projects carry the same row (a rebalance is in progress or settings changed).
-		// Prefer the row from the shard that *should* own this path under the current routing.
-		const expected = shardFor(row.path, this.host.settings.projects, this.host.settings.routing.hashSalt);
-		if (expected?.id === projectId) {
+		// Same path landed on multiple projects (rebalance in flight or settings
+		// changed). Pick the row with the newer updated_at — that's the most
+		// recent write regardless of which shard currently owns the path.
+		const existingTs = Date.parse(existing.row.updated_at);
+		const incomingTs = Date.parse(row.updated_at);
+		if (incomingTs > existingTs) {
 			remoteMap.set(row.path, { projectId, row });
+			return;
+		}
+		if (incomingTs === existingTs) {
+			// Exact tie: defer to the shard that *should* own the path under the
+			// current routing config.
+			const expected = shardFor(row.path, this.host.settings.projects, this.host.settings.routing.hashSalt);
+			if (expected?.id === projectId) {
+				remoteMap.set(row.path, { projectId, row });
+			}
 		}
 	}
 
+	private persistCursors(cursorAtStart: number, succeeded: Set<string>): void {
+		for (const id of succeeded) {
+			this.host.settings.projectSyncCursors[id] = cursorAtStart;
+		}
+		// Keep the legacy global cursor in sync for the settings-tab readout.
+		// (Per-project cursors are the authoritative incremental state; this is
+		// just "when did the last sync attempt finish".)
+		this.host.settings.lastSyncTime = cursorAtStart;
+	}
+
 	async fetchOnly(): Promise<void> {
+		if (this.syncInFlight) {
+			logger.debug("sync", "fetchOnly: deduped — sync already in flight");
+			return this.syncInFlight;
+		}
+		this.syncInFlight = this.runFetchOnly();
+		try {
+			await this.syncInFlight;
+		} finally {
+			this.syncInFlight = null;
+		}
+	}
+
+	private async runFetchOnly(): Promise<void> {
 		const { vaultId } = this.host.settings;
 		if (!vaultId) {
 			new Notice("Supabase jump: vault ID is not set — cannot fetch");
@@ -545,26 +706,35 @@ export class SyncEngine {
 
 		this.host.setStatus("syncing");
 		const errors: string[] = [];
-		// Capture the cursor BEFORE issuing the query so that any rows updated
-		// while the sync is in flight are picked up by the next sync.
+		// Capture cursor BEFORE issuing queries so anything updated mid-sync is
+		// picked up next round (per-project, so a stalled project doesn't lose
+		// its window).
 		const cursorAtStart = Date.now();
-		const sinceMs = this.host.settings.lastSyncTime;
+		const cursors = this.cursorsForEnabled();
 
 		try {
-			const remoteMap = await this.collectRemoteRows(sinceMs);
+			const { rows: remoteMap, succeeded } = await this.collectRemoteState(cursors);
+			let tombstoneCount = 0;
+			for (const [, loc] of remoteMap) if (loc.row.deleted) tombstoneCount++;
 			logger.info("sync", "fetchOnly: collected remote delta", {
 				count: remoteMap.size,
-				sinceMs,
-				incremental: sinceMs > 0,
+				tombstones: tombstoneCount,
+				projectsSucceeded: succeeded.size,
 			});
 
 			const pullCandidates: RemoteLocation[] = [];
+			const tombstones: RemoteLocation[] = [];
 			for (const [, loc] of remoteMap) {
 				if (this.shouldSkip(loc.row.path)) continue;
-				if (!this.shouldPull(loc.row)) continue;
 				if (this.crdtIsActive?.(loc.row.path)) continue;
+				if (loc.row.deleted) {
+					tombstones.push(loc);
+					continue;
+				}
+				if (!this.shouldPull(loc.row)) continue;
 				pullCandidates.push(loc);
 			}
+
 			await this.runWithConcurrency(pullCandidates, 6, async (loc) => {
 				const localMtime = await this.getLocalMtime(loc.row.path);
 				if (loc.row.mtime <= localMtime) return;
@@ -575,7 +745,36 @@ export class SyncEngine {
 				}
 			});
 
-			this.host.settings.lastSyncTime = cursorAtStart;
+			for (const loc of tombstones) {
+				// Tombstone replay: a peer marked this row deleted while we were
+				// offline. Honor it unless the local copy is newer than the
+				// tombstone (resurrect case — left for the next fullSync to push).
+				const localMtime = await this.getLocalMtime(loc.row.path);
+				if (localMtime === 0) {
+					// Nothing local, nothing to do.
+					continue;
+				}
+				const tombstoneTs = Date.parse(loc.row.updated_at);
+				if (Number.isFinite(tombstoneTs) && localMtime > tombstoneTs) {
+					logger.info("sync", `tombstone skipped: local newer than remote delete`, {
+						path: loc.row.path,
+						localMtime,
+						tombstoneTs,
+					});
+					continue;
+				}
+				try {
+					await this.deleteLocalFile(loc.row.path);
+				} catch (err) {
+					logger.warn("sync", `tombstone replay failed`, {
+						path: loc.row.path,
+						error: err instanceof Error ? err.message : String(err),
+					});
+					errors.push(loc.row.path);
+				}
+			}
+
+			this.persistCursors(cursorAtStart, succeeded);
 			await this.host.saveSettings();
 			this.host.setStatus("synced");
 
@@ -592,6 +791,19 @@ export class SyncEngine {
 	}
 
 	async fullSync(): Promise<void> {
+		if (this.syncInFlight) {
+			logger.debug("sync", "fullSync: deduped — sync already in flight");
+			return this.syncInFlight;
+		}
+		this.syncInFlight = this.runFullSync();
+		try {
+			await this.syncInFlight;
+		} finally {
+			this.syncInFlight = null;
+		}
+	}
+
+	private async runFullSync(): Promise<void> {
 		const { vaultId } = this.host.settings;
 		if (!vaultId) {
 			new Notice("Supabase jump: vault ID is not set — cannot sync");
@@ -604,14 +816,27 @@ export class SyncEngine {
 
 		this.host.setStatus("syncing");
 		const errors: string[] = [];
+		const cursorAtStart = Date.now();
+		// fullSync re-reconciles against everything, so query without a since
+		// filter. We still use the projectSyncCursors plumbing to mark per-project
+		// success when persisting at the end.
+		const baseCursors = new Map<string, number>();
+		for (const rt of this.host.pool.forAllEnabled()) baseCursors.set(rt.id, 0);
 
 		try {
-			const remoteMap = await this.collectRemoteRows();
+			const { rows: remoteMap, succeeded } = await this.collectRemoteState(baseCursors);
 
 			const localFiles = this.host.vault.getFiles().filter((f) => !this.shouldSkip(f.path));
 			const filesNeedingPush = localFiles.filter((file) => {
 				const remote = remoteMap.get(file.path);
-				return !remote || file.stat.mtime > remote.row.mtime;
+				if (!remote) return true;
+				if (remote.row.deleted) {
+					// Resurrect only if the local copy is strictly newer than the
+					// tombstone — otherwise the delete-pass below removes it.
+					const tombstoneTs = Date.parse(remote.row.updated_at);
+					return Number.isFinite(tombstoneTs) && file.stat.mtime > tombstoneTs;
+				}
+				return file.stat.mtime > remote.row.mtime;
 			});
 			await this.runWithConcurrency(filesNeedingPush, 6, async (file) => {
 				try {
@@ -628,7 +853,15 @@ export class SyncEngine {
 					const stat = await this.host.vault.adapter.stat(configPath);
 					if (!stat || stat.type !== "file") continue;
 					const remote = remoteMap.get(configPath);
-					if (!remote || stat.mtime > remote.row.mtime) {
+					const shouldPush =
+						!remote ||
+						(remote.row.deleted
+							? (() => {
+									const tombstoneTs = Date.parse(remote.row.updated_at);
+									return Number.isFinite(tombstoneTs) && stat.mtime > tombstoneTs;
+								})()
+							: stat.mtime > remote.row.mtime);
+					if (shouldPush) {
 						try {
 							const rt = this.host.pool.forFile(configPath);
 							if (!rt) {
@@ -645,10 +878,15 @@ export class SyncEngine {
 			}
 
 			const pullCandidates: RemoteLocation[] = [];
+			const tombstones: RemoteLocation[] = [];
 			for (const [, loc] of remoteMap) {
 				if (this.shouldSkip(loc.row.path)) continue;
-				if (!this.shouldPull(loc.row)) continue;
 				if (this.crdtIsActive?.(loc.row.path)) continue;
+				if (loc.row.deleted) {
+					tombstones.push(loc);
+					continue;
+				}
+				if (!this.shouldPull(loc.row)) continue;
 				pullCandidates.push(loc);
 			}
 			await this.runWithConcurrency(pullCandidates, 6, async (loc) => {
@@ -661,7 +899,26 @@ export class SyncEngine {
 				}
 			});
 
-			this.host.settings.lastSyncTime = Date.now();
+			for (const loc of tombstones) {
+				const localMtime = await this.getLocalMtime(loc.row.path);
+				if (localMtime === 0) continue;
+				const tombstoneTs = Date.parse(loc.row.updated_at);
+				if (Number.isFinite(tombstoneTs) && localMtime > tombstoneTs) {
+					// Local is newer — push pass above already handled the resurrect.
+					continue;
+				}
+				try {
+					await this.deleteLocalFile(loc.row.path);
+				} catch (err) {
+					logger.warn("sync", `tombstone replay failed`, {
+						path: loc.row.path,
+						error: err instanceof Error ? err.message : String(err),
+					});
+					errors.push(loc.row.path);
+				}
+			}
+
+			this.persistCursors(cursorAtStart, succeeded);
 			await this.host.saveSettings();
 			this.host.setStatus("synced");
 
@@ -731,6 +988,9 @@ export class SyncEngine {
 						state === "up" ? "synced" : state === "retrying" ? "degraded" : "error";
 					this.host.pool.updateStatus(project.id, target, `realtime ${state}`);
 				},
+				onSubscribed: (isReconnect) => {
+					if (isReconnect) this.scheduleReconnectFetch(project.id);
+				},
 				onJwtExpired: () => this.host.pool.refreshSession(project.id),
 			});
 
@@ -741,6 +1001,24 @@ export class SyncEngine {
 	stopRealtimeListeners(): void {
 		for (const ch of this.realtimeChannels.values()) ch.stop();
 		this.realtimeChannels.clear();
+	}
+
+	// Debounce so multiple projects reconnecting in quick succession trigger a
+	// single catch-up fetch. The fetchOnly call is itself dedup'd by the
+	// single-flight guard, so this is belt-and-braces.
+	private scheduleReconnectFetch(projectId: string): void {
+		logger.info("sync", `realtime reconnected — scheduling catch-up fetch`, { projectId });
+		if (this.reconnectFetchTimer !== null) return;
+		this.reconnectFetchTimer = window.setTimeout(() => {
+			this.reconnectFetchTimer = null;
+			void this.fetchOnly().catch((err) =>
+				logger.error("sync", `reconnect catch-up fetch failed`, {
+					error: err instanceof Error ? err.message : String(err),
+				}),
+			);
+			// Drain any edits that piled up while the channel was down.
+			this.flushNow();
+		}, RECONNECT_FETCH_DEBOUNCE_MS);
 	}
 
 	private async handleRealtimeEvent(
@@ -759,8 +1037,15 @@ export class SyncEngine {
 		});
 
 		if (eventType === "DELETE") {
-			const path = oldRow.path;
-			if (path) await this.deleteLocalFile(path);
+			// Hard DELETEs aren't part of this plugin's protocol — we soft-delete
+			// via `deleted=true` UPDATEs, which arrive as eventType "UPDATE" and
+			// are handled below. Postgres realtime only ships the PK in
+			// oldRow.* unless REPLICA IDENTITY FULL is set on the table, so the
+			// path is unreliable here. Log and ignore.
+			logger.debug("realtime", "ignoring hard-DELETE event (use soft-delete)", {
+				projectId,
+				oldRowKeys: Object.keys(oldRow ?? {}),
+			});
 			return;
 		}
 
@@ -811,6 +1096,36 @@ export class SyncEngine {
 			logger.warn("sync", `deleteLocalFile failed for "${path}"`, {
 				error: err instanceof Error ? err.message : String(err),
 			});
+			return;
+		}
+		await this.pruneEmptyAncestors(path);
+	}
+
+	// Walk up the parent chain and remove folders that are now empty. Stops at
+	// the first non-empty ancestor (or the vault root). Without this, syncing a
+	// peer's deletion leaves behind an orphan folder tree.
+	private async pruneEmptyAncestors(path: string): Promise<void> {
+		const segments = path.split("/");
+		segments.pop();
+		while (segments.length > 0) {
+			const folderPath = segments.join("/");
+			let listed: { files: string[]; folders: string[] };
+			try {
+				listed = await this.host.vault.adapter.list(folderPath);
+			} catch {
+				return;
+			}
+			if (listed.files.length > 0 || listed.folders.length > 0) return;
+			try {
+				await this.host.vault.adapter.rmdir(folderPath, false);
+			} catch (err) {
+				logger.debug("sync", `pruneEmptyAncestors: rmdir failed`, {
+					folderPath,
+					error: err instanceof Error ? err.message : String(err),
+				});
+				return;
+			}
+			segments.pop();
 		}
 	}
 
@@ -885,7 +1200,15 @@ export class SyncEngine {
 
 	private async flushQueue(): Promise<void> {
 		this.flushTimer = null;
-		if (this.host.pool.enabledProjectCount() === 0) return;
+		if (this.host.pool.enabledProjectCount() === 0) {
+			// Preserve queued edits: callers will retry via flushNow() once a
+			// project comes online. Otherwise edits made while disconnected are
+			// silently lost.
+			logger.debug("sync", "flushQueue: no enabled projects — keeping queue intact", {
+				queued: this.changeQueue.size,
+			});
+			return;
+		}
 
 		const entries = [...this.changeQueue.entries()];
 		this.changeQueue.clear();
@@ -898,17 +1221,37 @@ export class SyncEngine {
 						await this.pushFile(file);
 					} else {
 						const rt = this.host.pool.forFile(path);
-						if (!rt) continue;
+						if (!rt) {
+							logger.warn("sync", `flushQueue: no shard for "${path}" — skipped`);
+							continue;
+						}
 						const userId = await this.userIdFor(rt.id);
 						await this.pushAdapterFile(path, userId, this.host.settings.vaultId, rt.client);
 					}
 				} else {
 					await this.deleteRemoteFile(path);
 				}
-			} catch {
-				// Error already surfaced by pushFile/deleteRemoteFile
+			} catch (err) {
+				logger.warn("sync", `flushQueue: ${type} failed for "${path}"`, {
+					error: err instanceof Error ? err.message : String(err),
+				});
 			}
 		}
+	}
+
+	// Public entry point used after a successful (re)connect to drain any edits
+	// that were debounced while no projects were available.
+	flushNow(): void {
+		if (this.changeQueue.size === 0) return;
+		if (this.flushTimer !== null) {
+			window.clearTimeout(this.flushTimer);
+			this.flushTimer = null;
+		}
+		this.flushQueue().catch((err) =>
+			logger.error("sync", `flushNow failed`, {
+				error: err instanceof Error ? err.message : String(err),
+			}),
+		);
 	}
 
 	stopAll(): void {
@@ -923,6 +1266,10 @@ export class SyncEngine {
 		if (this.flushTimer !== null) {
 			window.clearTimeout(this.flushTimer);
 			this.flushTimer = null;
+		}
+		if (this.reconnectFetchTimer !== null) {
+			window.clearTimeout(this.reconnectFetchTimer);
+			this.reconnectFetchTimer = null;
 		}
 		this.stopRealtimeListeners();
 		this.changeQueue.clear();
